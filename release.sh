@@ -35,17 +35,23 @@ echo "==> Signing with '${IDENTITY}' (hardened runtime)"
 codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 
-echo "==> Notarizing (profile: ${PROFILE})"
 ditto -c -k --keepParent "$APP" "$ZIP"
-xcrun notarytool submit "$ZIP" --keychain-profile "$PROFILE" --wait
 
-echo "==> Stapling notarization ticket"
-xcrun stapler staple "$APP"
-rm -f "$ZIP"
-ditto -c -k --keepParent "$APP" "$ZIP"
+# SKIP_NOTARIZE=1 produces a signed-but-unnotarized zip: installable, but Gatekeeper
+# warns on first launch. Only useful when no notary profile is set up yet.
+if [ "${SKIP_NOTARIZE:-0}" = "1" ]; then
+    echo "==> Skipping notarization (SKIP_NOTARIZE=1) — first launch will warn"
+else
+    echo "==> Notarizing (profile: ${PROFILE})"
+    xcrun notarytool submit "$ZIP" --keychain-profile "$PROFILE" --wait
+    echo "==> Stapling notarization ticket"
+    xcrun stapler staple "$APP"
+    rm -f "$ZIP"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+fi
 
 echo ""
-echo "Done: ${ZIP} — opens on any Mac (macOS 14+) with no warnings."
+echo "Done: ${ZIP} (macOS 14+, universal)."
 echo "Publish:"
 echo "  1. gh release create v${VERSION} ${ZIP} --title \"Xstream ${VERSION}\" --notes \"...\""
 echo "  2. /opt/homebrew/Library/Taps/steingmo/homebrew-tap/bump-cask.sh xstream-player ${VERSION}"
