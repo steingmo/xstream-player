@@ -1,4 +1,3 @@
-import AVKit
 import Sparkle
 import SwiftUI
 
@@ -33,11 +32,7 @@ struct ContentView: View {
     @State private var draftName = ""
     @State private var draft = Server()
     @State private var importing = false
-    @State private var player = AVPlayer()
-    @State private var playerError: String?
-    @State private var remuxing = false
-    /// "" = built-in AVPlayer, otherwise an External.bundleID.
-    @AppStorage("externalPlayer") private var externalPlayer = External.defaultChoice
+    @State private var playError: String?
     @State private var favorites = Favorites.load()
     @State private var guide = Guide()
 
@@ -104,15 +99,8 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 if loading { ProgressView().padding() }
                 if let error { Text(error).foregroundStyle(.red).padding(.horizontal).textSelection(.enabled) }
-                HStack {
-                    Picker("", selection: $group) {
-                        ForEach(groups, id: \.self) { Text($0).tag($0) }
-                    }
-                    Picker("", selection: $externalPlayer) {
-                        Text("Built-in").tag("")
-                        ForEach(External.installed) { Text($0.name).tag($0.id) }
-                    }
-                    .frame(width: 110)
+                Picker("", selection: $group) {
+                    ForEach(groups, id: \.self) { Text($0).tag($0) }
                 }
                 .labelsHidden().padding(6)
                 List(shown, selection: Binding(get: { playing?.id }, set: { id in
@@ -152,50 +140,49 @@ struct ContentView: View {
             .searchable(text: $query, placement: .toolbar, prompt: "Search channels")
             .navigationSplitViewColumnWidth(min: 240, ideal: 320)
         } detail: {
-            PlayerView(player: player)
-                .background(.black)
-                .safeAreaInset(edge: .bottom) {
-                    if let playing {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text(playing.name).font(.headline).lineLimit(1)
-                                Spacer()
-                                Menu("Open in") {
-                                    ForEach(External.installed) { ext in
-                                        Button(ext.name) { ext.play(playing.url) }
-                                    }
-                                }
-                                .frame(width: 90)
-                                Button("Copy URL") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(playing.url.absoluteString, forType: .string)
-                                }
-                            }
-                            if let playerError {
-                                Text(playerError).font(.caption).foregroundStyle(.red)
-                                    .textSelection(.enabled)
-                            }
-                            if guide.programmes(playing).isEmpty {
-                                Text(playing.url.absoluteString).font(.caption2)
-                                    .foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
-                            } else {
-                                GuideView(programmes: guide.programmes(playing))
-                            }
+            if let playing {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 12) {
+                        AsyncImage(url: playing.logo) { $0.resizable().scaledToFit() }
+                            placeholder: { Image(systemName: "tv").font(.largeTitle)
+                                .foregroundStyle(.secondary) }
+                            .frame(width: 96, height: 72)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(playing.name).font(.title2).bold().textSelection(.enabled)
+                            Text(playing.group).font(.caption).foregroundStyle(.secondary)
                         }
-                        .padding(8)
-                        .background(.bar)
                     }
+                    if let playError {
+                        Text(playError).foregroundStyle(.red).textSelection(.enabled)
+                    }
+                    if !guide.programmes(playing).isEmpty {
+                        GuideView(programmes: guide.programmes(playing))
+                    }
+                    HStack {
+                        Button("Play in VLC") { play(playing) }
+                            .keyboardShortcut(.defaultAction)
+                        Button("Copy URL") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(playing.url.absoluteString, forType: .string)
+                        }
+                    }
+                    Text(playing.url.absoluteString).font(.caption2)
+                        .foregroundStyle(.secondary).textSelection(.enabled)
+                    Spacer()
                 }
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ContentUnavailableView("No channel selected", systemImage: "play.rectangle",
+                                       description: Text("Pick a channel and it opens in VLC."))
+            }
         }
         .onAppear {
             // Deferred: setting selection inside the table's first update is reentrant.
             if selected == nil { Task { selected = sources.first?.id } }
         }
         .task(id: selected) { await loadSelected() }
-        .task(id: playing?.id) { await watchPlayback() }
         .task(id: playing?.id) { await loadEPG() }
-        .onReceive(NotificationCenter.default.publisher(
-            for: NSApplication.willTerminateNotification)) { _ in Remux.stop() }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.data]) { result in
             guard let url = try? result.get() else { return }
             add(Source(name: url.lastPathComponent, kind: .m3u(path: url.path)))
@@ -225,71 +212,10 @@ struct ContentView: View {
         selected = s.id
     }
 
-    // Many IPTV panels 403 the default CFNetwork agent but serve any "player" UA.
-    private static let userAgent = "VLC/3.0.20 LibVLC/3.0.20"
-
     private func play(_ c: Channel) {
-        Remux.stop()
         playing = c
-        playerError = nil
-        remuxing = false
-        // Raw MPEG-TS never plays natively, so don't waste a failed attempt on it.
-        if let ext = External.installed.first(where: { $0.id == externalPlayer }) {
-            ext.play(c.url)          // VLC/Infuse handle redirects and TS themselves
-            return
-        }
-        Task {
-            let url = await resolveStream(c.url, userAgent: Self.userAgent)
-            guard playing?.id == c.id else { return }          // user moved on
-            // Raw MPEG-TS never plays natively, so don't waste a failed attempt on it.
-            if url.pathExtension.lowercased() == "ts" { await playViaRemux(url) } else { open(url) }
-        }
-    }
-
-    private func open(_ url: URL) {
-        let asset = AVURLAsset(url: url, options: [
-            "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.userAgent]
-        ])
-        player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
-        player.play()
-    }
-
-    private func playViaRemux(_ source: URL) async {
-        remuxing = true
-        playerError = "Remuxing MPEG-TS with ffmpeg…"
-        do {
-            open(try await Remux.start(source, userAgent: Self.userAgent))
-            playerError = nil
-        } catch {
-            playerError = error.localizedDescription
-        }
-    }
-
-    /// Poll the item instead of wiring up KVO — a stalled IPTV stream is the normal case
-    /// here and the user needs to be told which way it failed.
-    private func watchPlayback() async {
-        guard let playing, externalPlayer.isEmpty else { return }
-        for _ in 0..<40 {
-            try? await Task.sleep(for: .milliseconds(250))
-            if remuxing { return }                                  // remux path reports itself
-            if player.currentItem?.status == .readyToPlay { playerError = nil; return }
-            if let e = player.currentItem?.error ?? player.error {
-                await failed(playing, e.localizedDescription)
-                return
-            }
-        }
-        await failed(playing, "Stream never became ready (server stalled).")
-    }
-
-    /// HLS failed — on Xtream the same channel is also served as raw .ts, which ffmpeg can
-    /// repackage. Try that once before giving up.
-    private func failed(_ c: Channel, _ reason: String) async {
-        if let ts = tsVariant(c.url) {
-            await playViaRemux(ts)
-            if playerError != nil { playerError = "\(reason) Retried as MPEG-TS: \(playerError!)" }
-        } else {
-            playerError = reason
-        }
+        playError = nil
+        do { try VLC.play(c.url) } catch { playError = error.localizedDescription }
     }
 
     private func loadEPG() async {
@@ -315,23 +241,6 @@ struct ContentView: View {
             if !Task.isCancelled { self.error = error.localizedDescription }
         }
     }
-}
-
-/// SwiftUI's VideoPlayer sizes itself to the video and overflows the pane; AVPlayerView
-/// lays out correctly and brings the full native controls (fullscreen, PiP, AirPlay).
-struct PlayerView: NSViewRepresentable {
-    let player: AVPlayer
-
-    func makeNSView(context: Context) -> AVPlayerView {
-        let v = AVPlayerView()
-        v.player = player
-        v.controlsStyle = .floating
-        v.showsFullScreenToggleButton = true
-        v.allowsPictureInPicturePlayback = true
-        return v
-    }
-
-    func updateNSView(_ v: AVPlayerView, context: Context) { v.player = player }
 }
 
 /// Now and next, from the channel's short EPG. Live TV needs the current programme's

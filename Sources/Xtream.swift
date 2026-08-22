@@ -132,7 +132,8 @@ enum Xtream {
         let lc = names(try await liveCats)
         for r in try await live {
             guard let id = string(r, "stream_id"), let name = string(r, "name"),
-                  // .m3u8 (HLS), not .ts — AVPlayer can't demux raw MPEG-TS.
+                  // .m3u8 rather than .ts: both work in VLC, and HLS survives a flaky
+                  // connection better. Panels with HLS disabled would need .ts here.
                   let url = URL(string: "\(b)/live/\(u)/\(p)/\(id).m3u8") else { continue }
             out.append(Channel(id: "live-\(id)", name: name,
                                group: lc[string(r, "category_id") ?? ""] ?? "Live",
@@ -230,138 +231,20 @@ func parseM3U(_ text: String, base: URL? = nil) -> [Channel] {
     return out
 }
 
-// MARK: - MPEG-TS remux
-// AVPlayer has no MPEG-TS demuxer, and most Xtream panels serve .ts. ffmpeg repackages the
-// same elementary streams into a local HLS playlist (-c copy, no transcode) that AVPlayer
-// can open. ponytail: one stream at a time, and a copy-only remux — a channel using codecs
-// HLS can't carry (MPEG-2, AC-3) still fails; add an -c:v h264 transcode branch if that shows up.
-
-enum Remux {
-    static let ffmpeg: String? = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-        .first { FileManager.default.isExecutableFile(atPath: $0) }
-
-    private static var proc: Process?
-    private static let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent("xstream-remux", isDirectory: true)
-
-    static func stop() {
-        proc?.terminate()
-        proc = nil
-    }
-
-    /// Starts ffmpeg on `source` and returns a local playlist URL once it has segments.
-    static func start(_ source: URL, userAgent: String) async throws -> URL {
-        guard let ffmpeg else {
-            throw Err("This channel is MPEG-TS, which the native player can't decode. Install ffmpeg (brew install ffmpeg) to remux it, or use Open Externally.")
-        }
-        stop()
-        try? FileManager.default.removeItem(at: dir)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let playlist = dir.appendingPathComponent("stream.m3u8")
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: ffmpeg)
-        p.arguments = [
-            "-hide_banner", "-loglevel", "error",
-            "-user_agent", userAgent,
-            "-i", source.absoluteString,
-            "-c", "copy",
-            "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
-            "-hls_flags", "delete_segments+omit_endlist",
-            playlist.path,
-        ]
-        let errPipe = Pipe()
-        p.standardError = errPipe
-        p.standardOutput = FileHandle.nullDevice
-        try p.run()
-        proc = p
-
-        // Wait for the first segments to land, else AVPlayer opens an empty playlist.
-        for _ in 0..<60 {
-            try? await Task.sleep(for: .milliseconds(250))
-            if let s = try? String(contentsOf: playlist, encoding: .utf8), s.contains(".ts") { return playlist }
-            if !p.isRunning {
-                let msg = String(data: errPipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
-                throw Err("ffmpeg could not read the stream. \(msg.split(separator: "\n").last.map(String.init) ?? "")")
-            }
-        }
-        stop()
-        throw Err("ffmpeg produced no segments within 15s — the server is stalling or the stream is dead.")
-    }
-}
-
-/// Xtream serves the same channel at .m3u8 (HLS) and .ts (raw MPEG-TS). Swap to .ts.
-func tsVariant(_ url: URL) -> URL? {
-    guard url.pathExtension.lowercased() == "m3u8" else { return nil }
-    return url.deletingPathExtension().appendingPathExtension("ts")
-}
-
-// MARK: - Redirect resolution
-
-/// AVFoundation refuses to follow an https→http redirect and reports it as "A TLS error
-/// caused the secure connection to fail". Xtream panels behind Cloudflare routinely 302 a
-/// stream to a plain-http edge node, so resolve the chain ourselves and hand AVPlayer the
-/// final URL. Headers only — the body is cancelled, so this never pulls the stream itself.
-private final class StopAtRedirect: NSObject, URLSessionTaskDelegate {
-    static let shared = StopAtRedirect()
-    func urlSession(_ session: URLSession, task: URLSessionTask,
-                    willPerformHTTPRedirection response: HTTPURLResponse,
-                    newRequest request: URLRequest,
-                    completionHandler: @escaping (URLRequest?) -> Void) {
-        completionHandler(nil)
-    }
-}
-
-func resolveStream(_ url: URL, userAgent: String) async -> URL {
-    var current = url
-    for _ in 0..<5 {
-        var req = URLRequest(url: current)
-        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        guard let (bytes, response) = try? await URLSession.shared.bytes(for: req, delegate: StopAtRedirect.shared),
-              let http = response as? HTTPURLResponse else { return current }
-        bytes.task.cancel()
-        guard (300...399).contains(http.statusCode),
-              let location = http.value(forHTTPHeaderField: "Location"),
-              let next = URL(string: location, relativeTo: current) else { return current }
-        current = next.absoluteURL
-    }
-    return current
-}
-
-// MARK: - External players
+// MARK: - VLC
 
 import AppKit
 
-/// Handing the stream to VLC/Infuse/IINA sidesteps every AVFoundation limitation at once:
-/// they demux MPEG-TS, follow https→http redirects, and handle mkv/AC-3.
-struct External: Identifiable, Hashable {
-    let name: String
-    let bundleID: String
-    let app: URL
-    var id: String { bundleID }
+/// Every stream goes to VLC. It demuxes MPEG-TS, follows the https→http redirects Xtream
+/// panels hand out, and copes with mkv/AC-3 — none of which AVFoundation manages. That is
+/// why the built-in player, its redirect resolver and the ffmpeg remux are all gone: they
+/// existed only to work around AVFoundation, and VLC needs none of it.
+enum VLC {
+    static let app: URL? = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "org.videolan.vlc")
 
-    static let installed: [External] = [
-        ("VLC", "org.videolan.vlc"),
-        ("IINA", "com.colliderli.iina"),
-        ("Infuse", "com.firecore.infuse"),
-        ("mpv", "io.mpv"),
-        ("QuickTime Player", "com.apple.QuickTimePlayerX"),
-    ].compactMap { name, id in
-        NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
-            .map { External(name: name, bundleID: id, app: $0) }
-    }
-
-    /// VLC is the default when installed: it demuxes TS and follows redirects, so it works
-    /// on panels the native player can't touch. Falls back to the built-in player if absent.
-    static let defaultChoice = installed.first { $0.bundleID == "org.videolan.vlc" }?.id ?? ""
-
-    func play(_ stream: URL) {
-        // Infuse takes streams through its x-callback scheme rather than as an opened URL.
-        if bundleID == "com.firecore.infuse",
-           let enc = stream.absoluteString.addingPercentEncoding(withAllowedCharacters: .alphanumerics),
-           let deepLink = URL(string: "infuse://x-callback-url/play?url=\(enc)") {
-            NSWorkspace.shared.open(deepLink)
-            return
+    static func play(_ stream: URL) throws {
+        guard let app else {
+            throw Err("VLC is not installed. Install it with:  brew install --cask vlc")
         }
         NSWorkspace.shared.open([stream], withApplicationAt: app,
                                 configuration: NSWorkspace.OpenConfiguration())

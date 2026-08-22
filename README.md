@@ -12,10 +12,8 @@ channel list in a real Mac app, playing in AVKit, VLC, or Infuse.
   with progress for the one playing. Rows fetch their own guide as they scroll
   into view and cache it, so a 5000-channel portal costs a few requests, not 5000
 - **Search and category filter** across the whole channel list
-- **Choose your player** — VLC or Infuse by default when installed, or the
-  built-in AVKit player with fullscreen, Picture-in-Picture, and AirPlay
-- **MPEG-TS fallback** — AVFoundation can't demux `.ts`, so the built-in player
-  remuxes it to local HLS with ffmpeg when ffmpeg is installed
+- **Plays in VLC** — pick a channel and it opens there, with the guide and stream
+  details staying in Xstream
 - **Updates itself** — Sparkle checks the appcast and installs new versions in
   place; also available on demand from *Xstream ▸ Check for Updates…*
 - Real error messages when a stream fails, not a black rectangle
@@ -55,15 +53,17 @@ ad-hoc signed rather than notarized — fine locally, since macOS only quarantin
 what it downloaded. Pick one install method: `./build.sh install` overwrites
 `/Applications/Xstream.app`, including a copy Homebrew is managing.
 
-## Why the external players
+## Why VLC
 
 Most Xtream panels serve raw MPEG-TS and sit behind a CDN that redirects
 `https://` stream URLs to a plain-`http` edge node. AVFoundation refuses both —
 it has no TS demuxer, and it reports the redirect downgrade as *"A TLS error
-caused the secure connection to fail"*. VLC and Infuse handle both without
-complaint, so Xstream hands them the URL and stays out of the way. The built-in
-player resolves the redirect chain itself and falls back to an ffmpeg remux, but
-VLC remains the default because it just works.
+caused the secure connection to fail"*. VLC handles both without complaint, so
+Xstream hands it the URL and stays out of the way. Xstream is the channel list,
+the search, the favorites and the guide; VLC is the player.
+
+Install it with `brew install --cask vlc` if you don't have it — Xstream will say
+so if it's missing.
 
 ## Build from source
 
@@ -83,7 +83,7 @@ The icon is generated, not checked in as artwork alone — edit
 
 ## Note
 
-Xstream is a player. It ships with no channels, no playlists, and no provider —
+Xstream is a channel browser, not a player. It ships with no channels, no playlists, and no provider —
 you bring your own subscription, exactly as you would with VLC.
 
 ## License
