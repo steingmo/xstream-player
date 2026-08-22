@@ -7,6 +7,9 @@ channel list in a real Mac app, playing in AVKit, VLC, or Infuse.
   channels and the VOD catalogue load with their categories
 - **M3U playlists** — open any `.m3u`/`.m3u8` file, with `group-title` and
   `tvg-logo` honoured
+- **Favorites** — star any channel (right-click) and filter the list to just those
+- **EPG** — now and next for the playing channel, with progress through the
+  current programme, from the portal's own guide data
 - **Search and category filter** across the whole channel list
 - **Choose your player** — VLC or Infuse by default when installed, or the
   built-in AVKit player with fullscreen, Picture-in-Picture, and AirPlay

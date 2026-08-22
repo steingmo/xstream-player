@@ -30,4 +30,10 @@ s.host = "tv.example.com"
 assert(Xtream.base(s) == "http://tv.example.com", Xtream.base(s))
 assert(Xtream.string(["stream_id": 42], "stream_id") == "42")
 
+// EPG text: panels base64 it, inconsistently.
+assert(decodeEPGText("UHJlbWllciBMZWFndWU=") == "Premier League", decodeEPGText("UHJlbWllciBMZWFndWU="))
+assert(decodeEPGText("Premier League") == "Premier League")   // not base64 -> passed through
+assert(decodeEPGText("News") == "News", decodeEPGText("News")) // 4 chars: valid base64, invalid UTF-8
+assert(decodeEPGText("") == "")
+
 print("ok — \(cs.count) channels parsed, all checks passed")

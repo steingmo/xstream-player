@@ -27,14 +27,37 @@ struct ContentView: View {
     @State private var remuxing = false
     /// "" = built-in AVPlayer, otherwise an External.bundleID.
     @AppStorage("externalPlayer") private var externalPlayer = External.defaultChoice
+    @State private var favorites = Favorites.load()
+    @State private var epg: [Programme] = []
 
-    private var groups: [String] { ["All"] + Set(channels.map(\.group)).sorted() }
+    private static let favoritesGroup = "\u{2605} Favorites"
+
+    private var groups: [String] {
+        ["All", Self.favoritesGroup] + Set(channels.map(\.group)).sorted()
+    }
 
     private var shown: [Channel] {
-        channels.filter {
-            (group == "All" || $0.group == group)
-                && (query.isEmpty || $0.name.localizedCaseInsensitiveContains(query))
+        channels.filter { c in
+            let inGroup: Bool
+            switch group {
+            case "All": inGroup = true
+            case Self.favoritesGroup: inGroup = isFavorite(c)
+            default: inGroup = c.group == group
+            }
+            return inGroup && (query.isEmpty || c.name.localizedCaseInsensitiveContains(query))
         }
+    }
+
+    private func isFavorite(_ c: Channel) -> Bool {
+        guard let selected else { return false }
+        return favorites.contains(Favorites.key(selected, c))
+    }
+
+    private func toggleFavorite(_ c: Channel) {
+        guard let selected else { return }
+        let key = Favorites.key(selected, c)
+        if favorites.contains(key) { favorites.remove(key) } else { favorites.insert(key) }
+        Favorites.save(favorites)
     }
 
     var body: some View {
@@ -82,7 +105,17 @@ struct ContentView: View {
                             placeholder: { Image(systemName: "tv").foregroundStyle(.secondary) }
                             .frame(width: 32, height: 24)
                         Text(c.name).lineLimit(1)
-                    }.tag(c.id)
+                        Spacer()
+                        if isFavorite(c) {
+                            Image(systemName: "star.fill").foregroundStyle(.yellow).font(.caption)
+                        }
+                    }
+                    .tag(c.id)
+                    .contextMenu {
+                        Button(isFavorite(c) ? "Remove from Favorites" : "Add to Favorites") {
+                            toggleFavorite(c)
+                        }
+                    }
                 }
             }
             .searchable(text: $query, placement: .toolbar, prompt: "Search channels")
@@ -111,8 +144,12 @@ struct ContentView: View {
                                 Text(playerError).font(.caption).foregroundStyle(.red)
                                     .textSelection(.enabled)
                             }
-                            Text(playing.url.absoluteString).font(.caption2)
-                                .foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
+                            if epg.isEmpty {
+                                Text(playing.url.absoluteString).font(.caption2)
+                                    .foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
+                            } else {
+                                GuideView(programmes: epg)
+                            }
                         }
                         .padding(8)
                         .background(.bar)
@@ -122,6 +159,7 @@ struct ContentView: View {
         .onAppear { if selected == nil { selected = sources.first?.id } }
         .task(id: selected) { await loadSelected() }
         .task(id: playing?.id) { await watchPlayback() }
+        .task(id: playing?.id) { await loadEPG() }
         .onReceive(NotificationCenter.default.publisher(
             for: NSApplication.willTerminateNotification)) { _ in Remux.stop() }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.data]) { result in
@@ -220,6 +258,14 @@ struct ContentView: View {
         }
     }
 
+    private func loadEPG() async {
+        epg = []
+        guard let c = playing, let streamID = c.streamID,
+              let kind = sources.first(where: { $0.id == selected })?.kind,
+              case .xtream(let server) = kind else { return }
+        epg = (try? await Xtream.epg(server, streamID: streamID)) ?? []
+    }
+
     private func loadSelected() async {
         guard let source = sources.first(where: { $0.id == selected }) else { return }
         loading = true; error = nil; channels = []; group = "All"
@@ -255,4 +301,39 @@ struct PlayerView: NSViewRepresentable {
     }
 
     func updateNSView(_ v: AVPlayerView, context: Context) { v.player = player }
+}
+
+/// Now and next, from the channel's short EPG. Live TV needs the current programme's
+/// progress more than it needs a full grid, so that is all this shows.
+struct GuideView: View {
+    let programmes: [Programme]
+
+    var body: some View {
+        let now = programmes.first(where: \.isNow) ?? programmes.first
+        VStack(alignment: .leading, spacing: 2) {
+            if let now {
+                HStack(spacing: 6) {
+                    Text(span(now)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    Text(now.title).font(.caption).bold().lineLimit(1)
+                }
+                if now.isNow {
+                    ProgressView(value: Date().timeIntervalSince(now.start),
+                                 total: max(now.stop.timeIntervalSince(now.start), 1))
+                        .controlSize(.small)
+                }
+            }
+            ForEach(programmes.filter { $0.start > (now?.start ?? .distantPast) }.prefix(2)) { p in
+                HStack(spacing: 6) {
+                    Text(span(p)).font(.caption2).monospacedDigit()
+                    Text(p.title).font(.caption2).lineLimit(1)
+                }
+                .foregroundStyle(.secondary)
+            }
+        }
+        .help(now?.summary ?? "")
+    }
+
+    private func span(_ p: Programme) -> String {
+        "\(p.start.formatted(date: .omitted, time: .shortened))–\(p.stop.formatted(date: .omitted, time: .shortened))"
+    }
 }

@@ -8,6 +8,18 @@ struct Channel: Identifiable, Hashable {
     let group: String
     let logo: URL?
     let url: URL
+    /// Xtream live stream id — nil for VOD and for M3U entries, which have no EPG.
+    var streamID: String? = nil
+}
+
+struct Programme: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let summary: String
+    let start: Date
+    let stop: Date
+
+    var isNow: Bool { let t = Date(); return t >= start && t < stop }
 }
 
 struct Server: Codable, Hashable {
@@ -25,6 +37,14 @@ struct Source: Codable, Hashable, Identifiable {
     var id = UUID()
     var name: String
     var kind: SourceKind
+}
+
+/// Xtream panels base64-encode EPG text, but not all of them do it consistently —
+/// fall back to the raw string when it isn't valid base64.
+func decodeEPGText(_ raw: String) -> String {
+    guard let d = Data(base64Encoded: raw, options: .ignoreUnknownCharacters),
+          let s = String(data: d, encoding: .utf8), !s.isEmpty else { return raw }
+    return s
 }
 
 struct Err: LocalizedError {
@@ -79,15 +99,17 @@ enum Xtream {
         return nil
     }
 
-    private static func rows(_ s: Server, _ action: String) async throws -> [[String: Any]] {
-        let str = "\(base(s))/player_api.php?username=\(esc(s.username))&password=\(esc(s.password))&action=\(action)"
+    private static func rows(_ s: Server, _ action: String, _ extra: String = "") async throws -> [[String: Any]] {
+        let str = "\(base(s))/player_api.php?username=\(esc(s.username))&password=\(esc(s.password))&action=\(action)\(extra)"
         guard let u = URL(string: str) else { throw Err("Bad server address") }
         let (d, r) = try await URLSession.shared.data(from: u)
         if let h = r as? HTTPURLResponse, h.statusCode != 200 { throw Err("HTTP \(h.statusCode) on \(action)") }
-        guard let a = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] else {
-            throw Err("Unexpected reply to \(action) — wrong credentials or not an Xtream server?")
-        }
-        return a
+        let json = try? JSONSerialization.jsonObject(with: d)
+        // Stream lists come back as a bare array; get_short_epg wraps its array in an object.
+        if let a = json as? [[String: Any]] { return a }
+        if let o = json as? [String: Any],
+           let a = o.values.compactMap({ $0 as? [[String: Any]] }).first { return a }
+        throw Err("Unexpected reply to \(action) — wrong credentials or not an Xtream server?")
     }
 
     /// Live channels + VOD movies. Series are skipped: each one needs its own episode fetch.
@@ -114,7 +136,8 @@ enum Xtream {
                   let url = URL(string: "\(b)/live/\(u)/\(p)/\(id).m3u8") else { continue }
             out.append(Channel(id: "live-\(id)", name: name,
                                group: lc[string(r, "category_id") ?? ""] ?? "Live",
-                               logo: URL(string: string(r, "stream_icon") ?? ""), url: url))
+                               logo: URL(string: string(r, "stream_icon") ?? ""), url: url,
+                               streamID: id))
         }
 
         let vc = names(try await vodCats)
@@ -127,6 +150,41 @@ enum Xtream {
                                logo: URL(string: string(r, "stream_icon") ?? ""), url: url))
         }
         return out
+    }
+
+    /// Now/next for one live channel. get_short_epg is a single small request per channel;
+    /// the alternative (xmltv.php) is a multi-megabyte dump of the entire portal.
+    static func epg(_ s: Server, streamID: String, limit: Int = 8) async throws -> [Programme] {
+        let listings = try await rows(s, "get_short_epg", "&stream_id=\(streamID)&limit=\(limit)")
+        return listings.compactMap { r in
+            guard let startSecs = string(r, "start_timestamp").flatMap(Double.init),
+                  let stopSecs = string(r, "stop_timestamp").flatMap(Double.init) else { return nil }
+            return Programme(
+                id: string(r, "id") ?? "\(startSecs)",
+                title: decodeEPGText(string(r, "title") ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                summary: decodeEPGText(string(r, "description") ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                start: Date(timeIntervalSince1970: startSecs),
+                stop: Date(timeIntervalSince1970: stopSecs))
+        }
+        .sorted { $0.start < $1.start }
+    }
+}
+
+/// Starred channels, keyed by source + channel name so they survive a playlist reordering
+/// (M3U entry ids are positional). ponytail: UserDefaults, not a file — it is a string set.
+enum Favorites {
+    private static let key = "favorites"
+
+    static func key(_ source: Source.ID, _ channel: Channel) -> String {
+        "\(source.uuidString)|\(channel.name)"
+    }
+
+    static func load() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    }
+
+    static func save(_ favorites: Set<String>) {
+        UserDefaults.standard.set(Array(favorites), forKey: key)
     }
 }
 
