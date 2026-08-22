@@ -1,20 +1,27 @@
 #!/bin/sh
+# Local build. ./build.sh [run|install|test]
 set -e
 cd "$(dirname "$0")"
 APP="build/Xstream.app"
-TARGET="$(uname -m)-apple-macos14.0"
 
 if [ "$1" = "test" ]; then
+  # The parser checks don't touch Sparkle, so they compile straight with swiftc.
   mkdir -p build
-  swiftc -target "$TARGET" -o build/tests Sources/Xtream.swift Tests/main.swift
+  swiftc -target "$(uname -m)-apple-macos14.0" -o build/tests Sources/Xtream.swift Tests/main.swift
   exec ./build/tests
 fi
 
+swift build -c debug --product Xstream
+BIN=$(swift build -c debug --show-bin-path)
+
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
+cp "$BIN/Xstream" "$APP/Contents/MacOS/Xstream"
 cp Info.plist "$APP/Contents/Info.plist"
 cp Resources/app-icon.icns "$APP/Contents/Resources/app-icon.icns"
-swiftc -O -parse-as-library -target "$TARGET" -framework AVKit -framework AVFoundation -o "$APP/Contents/MacOS/Xstream" Sources/*.swift
+ditto "$BIN/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/Xstream" 2>/dev/null || true
+codesign --force --deep --sign - "$APP/Contents/Frameworks/Sparkle.framework" >/dev/null
 codesign --force --sign - "$APP"
 echo "built $APP"
 

@@ -374,6 +374,11 @@ struct External: Identifiable, Hashable {
 /// view and every answer is cached. Shared by the channel rows and the player footer.
 /// ponytail: no periodic refresh of row subtitles — a row re-renders on scroll and on
 /// selection, which is enough. Add a ticker if stale titles at the top of the hour annoy.
+/// @MainActor is load-bearing, not decoration: without it `load` runs on the cooperative
+/// pool, so the ~20 row tasks that fire on a fresh source mutate `listings`/`inflight`
+/// concurrently and corrupt them (SIGSEGV inside Set.insert). Only the dictionary writes
+/// happen here — the fetch and JSON parse stay off the main thread inside Xtream.epg.
+@MainActor
 @Observable
 final class Guide {
     private(set) var listings: [String: [Programme]] = [:]

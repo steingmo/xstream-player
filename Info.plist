@@ -5,12 +5,19 @@
   <key>CFBundleName</key><string>Xstream</string>
   <key>CFBundleExecutable</key><string>Xstream</string>
   <key>CFBundleIdentifier</key><string>com.steingrimosa.xstream</string>
-  <key>CFBundleVersion</key><string>2</string>
-  <key>CFBundleShortVersionString</key><string>1.1.0</string>
+  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>1.2.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>CFBundleIconFile</key><string>app-icon</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>SUEnableAutomaticChecks</key>
+  <true/>
+  <key>SUFeedURL</key>
+  <string>https://raw.githubusercontent.com/steingmo/xstream-player/main/appcast.xml</string>
+  <!-- Same Sparkle EdDSA key as the other apps; private half lives in the keychain. -->
+  <key>SUPublicEDKey</key>
+  <string>bfk3xLADn+lXCwFVWvwbYf4DL5e+imVJSHMz5s6sds0=</string>
   <!-- IPTV portals are usually plain HTTP -->
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
 </dict>

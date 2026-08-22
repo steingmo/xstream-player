@@ -1,11 +1,22 @@
-import SwiftUI
 import AVKit
+import Sparkle
+import SwiftUI
 
 @main
 struct XstreamApp: App {
+    // Sparkle checks the appcast on its own schedule; this also backs the menu item.
+    private let updater = SPUStandardUpdaterController(startingUpdater: true,
+                                                      updaterDelegate: nil,
+                                                      userDriverDelegate: nil)
+
     var body: some Scene {
         WindowGroup("Xstream") { ContentView() }
             .defaultSize(width: 1200, height: 720)
+            .commands {
+                CommandGroup(after: .appInfo) {
+                    Button("Check for Updates…") { updater.updater.checkForUpdates() }
+                }
+            }
     }
 }
 
@@ -105,7 +116,9 @@ struct ContentView: View {
                 }
                 .labelsHidden().padding(6)
                 List(shown, selection: Binding(get: { playing?.id }, set: { id in
-                    if let c = shown.first(where: { $0.id == id }) { play(c) }
+                    // Deferred for the same reason: play() mutates several @State values,
+                    // and the setter runs inside the table's selection delegate.
+                    if let c = shown.first(where: { $0.id == id }) { Task { play(c) } }
                 })) { c in
                     HStack {
                         AsyncImage(url: c.logo) { $0.resizable().scaledToFit() }
@@ -174,7 +187,10 @@ struct ContentView: View {
                     }
                 }
         }
-        .onAppear { if selected == nil { selected = sources.first?.id } }
+        .onAppear {
+            // Deferred: setting selection inside the table's first update is reentrant.
+            if selected == nil { Task { selected = sources.first?.id } }
+        }
         .task(id: selected) { await loadSelected() }
         .task(id: playing?.id) { await watchPlayback() }
         .task(id: playing?.id) { await loadEPG() }
@@ -320,6 +336,10 @@ struct PlayerView: NSViewRepresentable {
 
 /// Now and next, from the channel's short EPG. Live TV needs the current programme's
 /// progress more than it needs a full grid, so that is all this shows.
+// ponytail: the app logs "reentrant operation in its NSTableView delegate" at startup.
+// Verified it is not ours — it still fires with the row EPG task and the deferred
+// selection writes removed, so it comes from SwiftUI's own List bookkeeping. Harmless
+// today; revisit if a future macOS turns it into the promised assert.
 struct GuideView: View {
     let programmes: [Programme]
 

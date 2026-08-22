@@ -16,6 +16,8 @@ channel list in a real Mac app, playing in AVKit, VLC, or Infuse.
   built-in AVKit player with fullscreen, Picture-in-Picture, and AirPlay
 - **MPEG-TS fallback** — AVFoundation can't demux `.ts`, so the built-in player
   remuxes it to local HLS with ffmpeg when ffmpeg is installed
+- **Updates itself** — Sparkle checks the appcast and installs new versions in
+  place; also available on demand from *Xstream ▸ Check for Updates…*
 - Real error messages when a stream fails, not a black rectangle
 
 ## Install
@@ -65,7 +67,8 @@ VLC remains the default because it just works.
 
 ## Build from source
 
-Needs Xcode's command-line tools. No dependencies, no `.xcodeproj`:
+Needs Xcode's command-line tools. One dependency (Sparkle, for updates), no
+`.xcodeproj`:
 
 ```sh
 ./build.sh          # build build/Xstream.app

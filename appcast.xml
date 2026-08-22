@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Xstream</title>
+    <item>
+      <title>Version 1.2.0</title>
+      <pubDate>Sat, 22 Aug 2026 19:08:04 +0100</pubDate>
+      <sparkle:version>3</sparkle:version>
+      <sparkle:shortVersionString>1.2.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure
+        url="https://github.com/steingmo/xstream-player/releases/download/v1.2.0/Xstream.zip"
+        sparkle:edSignature="jVaJpHslBOnEsZlfw1KSr7zX8ECi8Y+Hlv2Q6MONnVdLKL7bYjb79y7/yCg+9sEokhLxOrsxW/BhfNjNwsxkAA==" length="2536761"
+        type="application/octet-stream"/>
+    </item>
+  </channel>
+</rss>
