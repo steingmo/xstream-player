@@ -28,7 +28,7 @@ struct ContentView: View {
     /// "" = built-in AVPlayer, otherwise an External.bundleID.
     @AppStorage("externalPlayer") private var externalPlayer = External.defaultChoice
     @State private var favorites = Favorites.load()
-    @State private var epg: [Programme] = []
+    @State private var guide = Guide()
 
     private static let favoritesGroup = "\u{2605} Favorites"
 
@@ -46,6 +46,13 @@ struct ContentView: View {
             }
             return inGroup && (query.isEmpty || c.name.localizedCaseInsensitiveContains(query))
         }
+    }
+
+    /// The Xtream server behind the selected source, if it is one — EPG needs it.
+    private var currentServer: Server? {
+        guard let kind = sources.first(where: { $0.id == selected })?.kind,
+              case .xtream(let server) = kind else { return nil }
+        return server
     }
 
     private func isFavorite(_ c: Channel) -> Bool {
@@ -104,13 +111,24 @@ struct ContentView: View {
                         AsyncImage(url: c.logo) { $0.resizable().scaledToFit() }
                             placeholder: { Image(systemName: "tv").foregroundStyle(.secondary) }
                             .frame(width: 32, height: 24)
-                        Text(c.name).lineLimit(1)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(c.name).lineLimit(1)
+                            if let now = guide.now(c) {
+                                Text(now.title).font(.caption2)
+                                    .foregroundStyle(.secondary).lineLimit(1)
+                            }
+                        }
                         Spacer()
                         if isFavorite(c) {
                             Image(systemName: "star.fill").foregroundStyle(.yellow).font(.caption)
                         }
                     }
                     .tag(c.id)
+                    .task(id: c.id) {
+                        guard let server = currentServer else { return }
+                        await guide.load(c, from: server, debounce: .milliseconds(400))
+                    }
+                    .help(guide.now(c).map { "\($0.title)\n\($0.summary)" } ?? "")
                     .contextMenu {
                         Button(isFavorite(c) ? "Remove from Favorites" : "Add to Favorites") {
                             toggleFavorite(c)
@@ -144,11 +162,11 @@ struct ContentView: View {
                                 Text(playerError).font(.caption).foregroundStyle(.red)
                                     .textSelection(.enabled)
                             }
-                            if epg.isEmpty {
+                            if guide.programmes(playing).isEmpty {
                                 Text(playing.url.absoluteString).font(.caption2)
                                     .foregroundStyle(.secondary).lineLimit(1).textSelection(.enabled)
                             } else {
-                                GuideView(programmes: epg)
+                                GuideView(programmes: guide.programmes(playing))
                             }
                         }
                         .padding(8)
@@ -259,16 +277,13 @@ struct ContentView: View {
     }
 
     private func loadEPG() async {
-        epg = []
-        guard let c = playing, let streamID = c.streamID,
-              let kind = sources.first(where: { $0.id == selected })?.kind,
-              case .xtream(let server) = kind else { return }
-        epg = (try? await Xtream.epg(server, streamID: streamID)) ?? []
+        guard let playing, let server = currentServer else { return }
+        await guide.load(playing, from: server)      // no debounce: the user picked this one
     }
 
     private func loadSelected() async {
         guard let source = sources.first(where: { $0.id == selected }) else { return }
-        loading = true; error = nil; channels = []; group = "All"
+        loading = true; error = nil; channels = []; group = "All"; guide.clear()
         defer { loading = false }
         do {
             switch source.kind {
@@ -309,8 +324,13 @@ struct GuideView: View {
     let programmes: [Programme]
 
     var body: some View {
+        // Re-renders every 30s so "now" and the progress bar don't go stale while watching.
+        TimelineView(.periodic(from: .now, by: 30)) { _ in content }
+    }
+
+    private var content: some View {
         let now = programmes.first(where: \.isNow) ?? programmes.first
-        VStack(alignment: .leading, spacing: 2) {
+        return VStack(alignment: .leading, spacing: 2) {
             if let now {
                 HStack(spacing: 6) {
                     Text(span(now)).font(.caption).monospacedDigit().foregroundStyle(.secondary)

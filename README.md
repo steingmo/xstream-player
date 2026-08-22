@@ -8,8 +8,9 @@ channel list in a real Mac app, playing in AVKit, VLC, or Infuse.
 - **M3U playlists** — open any `.m3u`/`.m3u8` file, with `group-title` and
   `tvg-logo` honoured
 - **Favorites** — star any channel (right-click) and filter the list to just those
-- **EPG** — now and next for the playing channel, with progress through the
-  current programme, from the portal's own guide data
+- **EPG** — the current programme under every channel in the list, plus now/next
+  with progress for the one playing. Rows fetch their own guide as they scroll
+  into view and cache it, so a 5000-channel portal costs a few requests, not 5000
 - **Search and category filter** across the whole channel list
 - **Choose your player** — VLC or Infuse by default when installed, or the
   built-in AVKit player with fullscreen, Picture-in-Picture, and AirPlay

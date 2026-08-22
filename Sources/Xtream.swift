@@ -367,3 +367,39 @@ struct External: Identifiable, Hashable {
                                 configuration: NSWorkspace.OpenConfiguration())
     }
 }
+
+// MARK: - Guide cache
+
+/// EPG is per-channel on Xtream (get_short_epg), so the list fills in as rows scroll into
+/// view and every answer is cached. Shared by the channel rows and the player footer.
+/// ponytail: no periodic refresh of row subtitles — a row re-renders on scroll and on
+/// selection, which is enough. Add a ticker if stale titles at the top of the hour annoy.
+@Observable
+final class Guide {
+    private(set) var listings: [String: [Programme]] = [:]
+    private var inflight: Set<String> = []
+
+    func programmes(_ channel: Channel) -> [Programme] { listings[channel.id] ?? [] }
+
+    func now(_ channel: Channel) -> Programme? { programmes(channel).first(where: \.isNow) }
+
+    func clear() {
+        listings = [:]
+        inflight = []
+    }
+
+    /// `debounce` lets rows that scroll straight past cancel before spending a request.
+    func load(_ channel: Channel, from server: Server, debounce: Duration = .zero) async {
+        guard let streamID = channel.streamID, listings[channel.id] == nil,
+              !inflight.contains(channel.id) else { return }
+        if debounce > .zero {
+            try? await Task.sleep(for: debounce)
+            if Task.isCancelled { return }
+        }
+        inflight.insert(channel.id)
+        defer { inflight.remove(channel.id) }
+        if let programmes = try? await Xtream.epg(server, streamID: streamID) {
+            listings[channel.id] = programmes
+        }
+    }
+}
