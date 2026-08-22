@@ -372,8 +372,8 @@ struct External: Identifiable, Hashable {
 
 /// EPG is per-channel on Xtream (get_short_epg), so the list fills in as rows scroll into
 /// view and every answer is cached. Shared by the channel rows and the player footer.
-/// ponytail: no periodic refresh of row subtitles — a row re-renders on scroll and on
-/// selection, which is enough. Add a ticker if stale titles at the top of the hour annoy.
+/// One ticker drives every row's idea of "now", so subtitles roll over at the top of the
+/// hour instead of showing whatever was current when the row first appeared.
 /// @MainActor is load-bearing, not decoration: without it `load` runs on the cooperative
 /// pool, so the ~20 row tasks that fire on a fresh source mutate `listings`/`inflight`
 /// concurrently and corrupt them (SIGSEGV inside Set.insert). Only the dictionary writes
@@ -382,11 +382,20 @@ struct External: Identifiable, Hashable {
 @Observable
 final class Guide {
     private(set) var listings: [String: [Programme]] = [:]
+    /// Observed by every row, so bumping it re-evaluates which programme is current.
+    private(set) var clock = Date()
     private var inflight: Set<String> = []
+
+    init() {
+        // Lives as long as the app does, so there is nothing to cancel.
+        Task { while true { try? await Task.sleep(for: .seconds(60)); clock = Date() } }
+    }
 
     func programmes(_ channel: Channel) -> [Programme] { listings[channel.id] ?? [] }
 
-    func now(_ channel: Channel) -> Programme? { programmes(channel).first(where: \.isNow) }
+    func now(_ channel: Channel) -> Programme? {
+        programmes(channel).first { clock >= $0.start && clock < $0.stop }
+    }
 
     func clear() {
         listings = [:]
