@@ -6,13 +6,14 @@
 #   2. Notary credentials:
 #        xcrun notarytool store-credentials xstream-notary \
 #          --apple-id <apple-id> --team-id <TEAMID> --password <app-specific-password>
+#      Defaults to the shared keytype-notary profile these apps already use.
 #      Already have a profile from another app? Point at it instead:
 #        XSTREAM_NOTARY_PROFILE=kvf-notary ./release.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
 IDENTITY="${XSTREAM_IDENTITY:-Developer ID Application}"
-PROFILE="${XSTREAM_NOTARY_PROFILE:-xstream-notary}"
+PROFILE="${XSTREAM_NOTARY_PROFILE:-keytype-notary}"
 APP=build/Xstream.app
 ZIP=build/Xstream.zip
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
