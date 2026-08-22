@@ -17,5 +17,14 @@ cp Resources/app-icon.icns "$APP/Contents/Resources/app-icon.icns"
 swiftc -O -parse-as-library -target "$TARGET" -framework AVKit -framework AVFoundation -o "$APP/Contents/MacOS/Xstream" Sources/*.swift
 codesign --force --sign - "$APP"
 echo "built $APP"
-[ "$1" = "run" ] && open "$APP"
+
+case "$1" in
+  run) open "$APP" ;;
+  # ditto rather than cp: it preserves the bundle's metadata, so the signature survives.
+  install)
+    rm -rf /Applications/Xstream.app
+    ditto "$APP" /Applications/Xstream.app
+    echo "installed /Applications/Xstream.app"
+    ;;
+esac
 exit 0

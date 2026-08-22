@@ -22,6 +22,33 @@ With [Homebrew](https://brew.sh):
 brew install --cask steingmo/tap/xstream-player
 ```
 
+### Or install manually
+
+Download the notarized universal build and drop it in `/Applications`:
+
+```sh
+curl -L https://github.com/steingmo/xstream-player/releases/latest/download/Xstream.zip \
+  -o ~/Downloads/Xstream.zip
+ditto -x -k ~/Downloads/Xstream.zip /Applications
+```
+
+Or grab `Xstream.zip` from the [releases page](https://github.com/steingmo/xstream-player/releases/latest),
+double-click it, and drag `Xstream.app` to Applications. The build is signed and
+notarized, so it opens without a Gatekeeper prompt.
+
+### Or build it yourself
+
+```sh
+git clone https://github.com/steingmo/xstream-player.git
+cd xstream-player
+./build.sh install
+```
+
+That needs Xcode's command-line tools and nothing else. Your own build is
+ad-hoc signed rather than notarized — fine locally, since macOS only quarantines
+what it downloaded. Pick one install method: `./build.sh install` overwrites
+`/Applications/Xstream.app`, including a copy Homebrew is managing.
+
 ## Why the external players
 
 Most Xtream panels serve raw MPEG-TS and sit behind a CDN that redirects
@@ -37,7 +64,9 @@ VLC remains the default because it just works.
 Needs Xcode's command-line tools. No dependencies, no `.xcodeproj`:
 
 ```sh
-./build.sh run      # build build/Xstream.app and launch it
+./build.sh          # build build/Xstream.app
+./build.sh run      # build and launch it
+./build.sh install  # build and copy to /Applications
 ./build.sh test     # run the M3U parser self-check
 ./release.sh        # signed, notarized, universal build for distribution
 ```
