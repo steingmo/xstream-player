@@ -14,6 +14,10 @@ channel list in a real Mac app, playing in AVKit, VLC, or Infuse.
 - **Search and category filter** across the whole channel list
 - **Plays in VLC** — pick a channel and it opens there, with the guide and stream
   details staying in Xstream
+- **Export to M3U** — hand your channels to anything that reads a playlist. The
+  list's own search and category filters are the picker: export what's visible,
+  just your favorites, or the whole source. Exported URLs contain your portal
+  username and password, so treat the file like a password
 - **Updates itself** — Sparkle checks the appcast and installs new versions in
   place; also available on demand from *Xstream ▸ Check for Updates…*
 - Real error messages when a stream fails, not a black rectangle

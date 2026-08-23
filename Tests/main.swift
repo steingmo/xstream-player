@@ -36,4 +36,26 @@ assert(decodeEPGText("Premier League") == "Premier League")   // not base64 -> p
 assert(decodeEPGText("News") == "News", decodeEPGText("News")) // 4 chars: valid base64, invalid UTF-8
 assert(decodeEPGText("") == "")
 
+// Export has to survive our own parser, or the file is no use to anyone else either.
+let roundTripped = parseM3U(exportM3U(cs), base: base)
+assert(roundTripped.count == cs.count, "\(roundTripped.count) != \(cs.count)")
+for (a, b) in zip(cs, roundTripped) {
+    assert(a.name == b.name, "\(a.name) != \(b.name)")
+    assert(a.group == b.group, "\(a.group) != \(b.group)")
+    assert(a.url == b.url, "\(a.url) != \(b.url)")
+    assert(a.logo == b.logo, "\(String(describing: a.logo)) != \(String(describing: b.logo))")
+}
+assert(exportM3U([]).hasPrefix("#EXTM3U"))
+
+// Real portals carry quotes in group names and stray whitespace in channel names —
+// both showed up in a 29k-channel export. Pin the documented normalisation.
+let tricky = [Channel(id: "x", name: "Ch \" One ", group: "US | \"Big Four\" Locals",
+                      logo: nil, url: URL(string: "http://example.com/live/1.ts")!)]
+let trickyBack = parseM3U(exportM3U(tricky), base: nil)
+assert(trickyBack[0].url == tricky[0].url, "url must survive exactly")
+assert(trickyBack[0].group == "US | 'Big Four' Locals", trickyBack[0].group)
+assert(trickyBack[0].name == "Ch \" One", trickyBack[0].name)   // parser trims the trailing space
+// And stable from there — a second trip changes nothing.
+assert(parseM3U(exportM3U(trickyBack), base: nil) == trickyBack)
+
 print("ok — \(cs.count) channels parsed, all checks passed")

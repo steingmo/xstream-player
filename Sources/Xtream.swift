@@ -231,6 +231,27 @@ func parseM3U(_ text: String, base: URL? = nil) -> [Channel] {
     return out
 }
 
+// MARK: - M3U export
+
+/// Writes a playlist any other player can open. Round-trips with parseM3U: URLs come back
+/// byte-identical, names and groups come back the same except that a double quote inside a
+/// group becomes an apostrophe and the parser trims surrounding whitespace. M3U attributes
+/// have no escape for a quote — every parser, ours included, reads to the next one — so
+/// substituting beats emitting a line that other apps would silently truncate.
+/// Note the URLs carry the portal's username and password, as any IPTV playlist does.
+func exportM3U(_ channels: [Channel]) -> String {
+    func attr(_ v: String) -> String { v.replacingOccurrences(of: "\"", with: "'") }
+
+    var out = "#EXTM3U\n"
+    for c in channels {
+        var attrs = ""
+        if let logo = c.logo?.absoluteString, !logo.isEmpty { attrs += " tvg-logo=\"\(attr(logo))\"" }
+        if !c.group.isEmpty { attrs += " group-title=\"\(attr(c.group))\"" }
+        out += "#EXTINF:-1\(attrs),\(c.name)\n\(c.url.absoluteString)\n"
+    }
+    return out
+}
+
 // MARK: - VLC
 
 import AppKit

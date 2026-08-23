@@ -1,5 +1,6 @@
 import Sparkle
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct XstreamApp: App {
@@ -33,6 +34,8 @@ struct ContentView: View {
     @State private var draft = Server()
     @State private var importing = false
     @State private var playError: String?
+    @State private var export: M3UFile?
+    @State private var exportName = "channels"
     @State private var favorites = Favorites.load()
     @State private var guide = Guide()
 
@@ -59,6 +62,19 @@ struct ContentView: View {
         guard let kind = sources.first(where: { $0.id == selected })?.kind,
               case .xtream(let server) = kind else { return nil }
         return server
+    }
+
+    private var favoriteChannels: [Channel] { channels.filter(isFavorite) }
+
+    private var sourceName: String {
+        sources.first(where: { $0.id == selected })?.name ?? "channels"
+    }
+
+    /// The list's own search and category filters are the export picker — whatever you can
+    /// see is what "Visible" writes out.
+    private func beginExport(_ scope: String, _ list: [Channel]) {
+        exportName = "\(sourceName) — \(scope)"
+        export = M3UFile(text: exportM3U(list))
     }
 
     private func isFavorite(_ c: Channel) -> Bool {
@@ -139,6 +155,26 @@ struct ContentView: View {
             }
             .searchable(text: $query, placement: .toolbar, prompt: "Search channels")
             .navigationSplitViewColumnWidth(min: 240, ideal: 320)
+            .toolbar {
+                Menu {
+                    Section("URLs include your portal password") {
+                        Button("Visible Channels… (\(shown.count))") {
+                            beginExport("visible", shown)
+                        }
+                        Button("Favorites… (\(favoriteChannels.count))") {
+                            beginExport("favorites", favoriteChannels)
+                        }
+                        .disabled(favoriteChannels.isEmpty)
+                        Button("All Channels… (\(channels.count))") {
+                            beginExport("all", channels)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .disabled(channels.isEmpty)
+                .help("Export as an M3U playlist")
+            }
         } detail: {
             if let playing {
                 VStack(alignment: .leading, spacing: 12) {
@@ -183,6 +219,10 @@ struct ContentView: View {
         }
         .task(id: selected) { await loadSelected() }
         .task(id: playing?.id) { await loadEPG() }
+        .fileExporter(isPresented: Binding(get: { export != nil }, set: { if !$0 { export = nil } }),
+                      document: export, contentType: .m3uPlaylist, defaultFilename: exportName) { _ in
+            export = nil
+        }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.data]) { result in
             guard let url = try? result.get() else { return }
             add(Source(name: url.lastPathComponent, kind: .m3u(path: url.path)))
@@ -284,5 +324,27 @@ struct GuideView: View {
 
     private func span(_ p: Programme) -> String {
         "\(p.start.formatted(date: .omitted, time: .shortened))–\(p.stop.formatted(date: .omitted, time: .shortened))"
+    }
+}
+
+extension UTType {
+    /// public.m3u-playlist exists on macOS, but fall back rather than crash if it ever moves.
+    static let m3uPlaylist = UTType(filenameExtension: "m3u") ?? .plainText
+}
+
+struct M3UFile: FileDocument {
+    static var readableContentTypes: [UTType] { [.m3uPlaylist] }
+
+    let text: String
+
+    init(text: String) { self.text = text }
+
+    init(configuration: ReadConfiguration) throws {
+        guard let d = configuration.file.regularFileContents else { throw CocoaError(.fileReadCorruptFile) }
+        text = String(decoding: d, as: UTF8.self)
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data(text.utf8))
     }
 }
