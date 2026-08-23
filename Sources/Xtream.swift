@@ -239,10 +239,17 @@ func parseM3U(_ text: String, base: URL? = nil) -> [Channel] {
 /// have no escape for a quote — every parser, ours included, reads to the next one — so
 /// substituting beats emitting a line that other apps would silently truncate.
 /// Note the URLs carry the portal's username and password, as any IPTV playlist does.
-func exportM3U(_ channels: [Channel]) -> String {
+func exportM3U(_ channels: [Channel], note: String? = nil, date: Date = Date()) -> String {
     func attr(_ v: String) -> String { v.replacingOccurrences(of: "\"", with: "'") }
 
+    // Comment lines after #EXTM3U: players ignore what they don't recognise, so this says
+    // where the file came from without making it unreadable anywhere.
     var out = "#EXTM3U\n"
+    out += "# Exported from Xstream — https://github.com/steingmo/xstream-player\n"
+    if let note { out += "# \(note)\n" }
+    out += "# \(channels.count) channel\(channels.count == 1 ? "" : "s"), "
+    out += "\(date.formatted(date: .abbreviated, time: .shortened))\n"
+    out += "# The stream URLs below contain your portal username and password.\n"
     for c in channels {
         var attrs = ""
         if let logo = c.logo?.absoluteString, !logo.isEmpty { attrs += " tvg-logo=\"\(attr(logo))\"" }

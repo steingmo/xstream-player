@@ -47,6 +47,15 @@ for (a, b) in zip(cs, roundTripped) {
 }
 assert(exportM3U([]).hasPrefix("#EXTM3U"))
 
+// The header is informational; it must not confuse a parser reading the file back.
+let headed = exportM3U(cs, note: "my portal (favorites)")
+assert(headed.hasPrefix("#EXTM3U\n# Exported from Xstream"), String(headed.prefix(60)))
+assert(headed.contains("# my portal (favorites)"))
+assert(headed.contains("# 3 channels, "))
+assert(exportM3U([Channel(id: "1", name: "One", group: "G", logo: nil,
+                          url: URL(string: "http://x/1.ts")!)]).contains("# 1 channel, "))
+assert(parseM3U(headed, base: base) == parseM3U(exportM3U(cs), base: base), "header changed parsing")
+
 // Real portals carry quotes in group names and stray whitespace in channel names —
 // both showed up in a 29k-channel export. Pin the documented normalisation.
 let tricky = [Channel(id: "x", name: "Ch \" One ", group: "US | \"Big Four\" Locals",

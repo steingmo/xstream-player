@@ -74,7 +74,7 @@ struct ContentView: View {
     /// see is what "Visible" writes out.
     private func beginExport(_ scope: String, _ list: [Channel]) {
         exportName = "\(sourceName) — \(scope)"
-        export = M3UFile(text: exportM3U(list))
+        export = M3UFile(text: exportM3U(list, note: "\(sourceName) (\(scope))"))
     }
 
     private func isFavorite(_ c: Channel) -> Bool {
