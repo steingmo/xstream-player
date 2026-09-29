@@ -23,7 +23,8 @@ BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" Info.plist)
 
 echo "==> Building universal binary (arm64 + x86_64)"
 swift build -c release --arch arm64 --arch x86_64 --product Xstream
-BIN=.build/apple/Products/Release
+# Asked, not hard-coded: Swift 6.4 moved universal builds from .build/apple to .build/out.
+BIN=$(swift build -c release --arch arm64 --arch x86_64 --product Xstream --show-bin-path)
 
 rm -rf "$APP" "$ZIP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
