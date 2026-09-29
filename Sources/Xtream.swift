@@ -73,8 +73,8 @@ enum Store {
 
     static func save(_ sources: [Source]) {
         guard let d = try? JSONEncoder().encode(sources) else { return }
-        try? d.write(to: file, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        // Created 0600 rather than chmod-ed after, so the password is never world-readable.
+        FileManager.default.createFile(atPath: file.path, contents: d, attributes: [.posixPermissions: 0o600])
     }
 }
 
@@ -268,7 +268,8 @@ import AppKit
 /// why the built-in player, its redirect resolver and the ffmpeg remux are all gone: they
 /// existed only to work around AVFoundation, and VLC needs none of it.
 enum VLC {
-    static let app: URL? = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "org.videolan.vlc")
+    /// Looked up on every play, so installing VLC while Xstream is open just works.
+    static var app: URL? { NSWorkspace.shared.urlForApplication(withBundleIdentifier: "org.videolan.vlc") }
 
     static func play(_ stream: URL) throws {
         guard let app else {

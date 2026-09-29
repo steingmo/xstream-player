@@ -9,6 +9,12 @@ struct XstreamApp: App {
                                                       updaterDelegate: nil,
                                                       userDriverDelegate: nil)
 
+    init() {
+        // Channel logos rarely carry cache headers, and the default cache is a few MB, so
+        // without this every logo re-downloads each time its row scrolls back into view.
+        URLCache.shared = URLCache(memoryCapacity: 50_000_000, diskCapacity: 200_000_000)
+    }
+
     var body: some Scene {
         WindowGroup("Xstream") { ContentView() }
             .defaultSize(width: 1200, height: 720)
@@ -119,38 +125,26 @@ struct ContentView: View {
                     ForEach(groups, id: \.self) { Text($0).tag($0) }
                 }
                 .labelsHidden().padding(6)
+                // Selecting only shows the channel; double-click or Return plays it. Playing on
+                // select sent every channel the arrow keys passed over to VLC.
                 List(shown, selection: Binding(get: { playing?.id }, set: { id in
-                    // Deferred for the same reason: play() mutates several @State values,
-                    // and the setter runs inside the table's selection delegate.
-                    if let c = shown.first(where: { $0.id == id }) { Task { play(c) } }
+                    // Deferred: the setter runs inside the table's selection delegate, and
+                    // mutating @State there is reentrant.
+                    let c = shown.first(where: { $0.id == id })
+                    Task { playing = c; playError = nil }
                 })) { c in
-                    HStack {
-                        AsyncImage(url: c.logo) { $0.resizable().scaledToFit() }
-                            placeholder: { Image(systemName: "tv").foregroundStyle(.secondary) }
-                            .frame(width: 32, height: 24)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(c.name).lineLimit(1)
-                            if let now = guide.now(c) {
-                                Text(now.title).font(.caption2)
-                                    .foregroundStyle(.secondary).lineLimit(1)
-                            }
-                        }
-                        Spacer()
-                        if isFavorite(c) {
-                            Image(systemName: "star.fill").foregroundStyle(.yellow).font(.caption)
-                        }
-                    }
-                    .tag(c.id)
-                    .task(id: c.id) {
-                        guard let server = currentServer else { return }
-                        await guide.load(c, from: server, debounce: .milliseconds(400))
-                    }
-                    .help(guide.now(c).map { "\($0.title)\n\($0.summary)" } ?? "")
-                    .contextMenu {
+                    ChannelRow(channel: c, guide: guide, server: currentServer,
+                               isFavorite: isFavorite(c))
+                        .tag(c.id)
+                }
+                .contextMenu(forSelectionType: Channel.ID.self) { ids in
+                    if let c = channels.first(where: { ids.contains($0.id) }) {
                         Button(isFavorite(c) ? "Remove from Favorites" : "Add to Favorites") {
                             toggleFavorite(c)
                         }
                     }
+                } primaryAction: { ids in
+                    if let c = channels.first(where: { ids.contains($0.id) }) { play(c) }
                 }
             }
             .searchable(text: $query, placement: .toolbar, prompt: "Search channels")
@@ -191,9 +185,7 @@ struct ContentView: View {
                     if let playError {
                         Text(playError).foregroundStyle(.red).textSelection(.enabled)
                     }
-                    if !guide.programmes(playing).isEmpty {
-                        GuideView(programmes: guide.programmes(playing))
-                    }
+                    GuideView(guide: guide, channel: playing)
                     HStack {
                         Button("Play in VLC") { play(playing) }
                             .keyboardShortcut(.defaultAction)
@@ -210,7 +202,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 ContentUnavailableView("No channel selected", systemImage: "play.rectangle",
-                                       description: Text("Pick a channel and it opens in VLC."))
+                                       description: Text("Double-click a channel to open it in VLC."))
             }
         }
         .onAppear {
@@ -264,8 +256,10 @@ struct ContentView: View {
     }
 
     private func loadSelected() async {
+        // Reset before the guard: removing the selected source must empty the list too.
+        error = nil; channels = []; group = "All"; playing = nil; guide.clear()
         guard let source = sources.first(where: { $0.id == selected }) else { return }
-        loading = true; error = nil; channels = []; group = "All"; guide.clear()
+        loading = true
         defer { loading = false }
         do {
             switch source.kind {
@@ -283,21 +277,60 @@ struct ContentView: View {
     }
 }
 
+/// Its own view so guide updates re-render one row, not ContentView: reading `guide` in
+/// ContentView's body re-ran the whole channel filter for every EPG reply.
+struct ChannelRow: View {
+    let channel: Channel
+    let guide: Guide
+    let server: Server?
+    let isFavorite: Bool
+
+    var body: some View {
+        let now = guide.now(channel)
+        HStack {
+            AsyncImage(url: channel.logo) { $0.resizable().scaledToFit() }
+                placeholder: { Image(systemName: "tv").foregroundStyle(.secondary) }
+                .frame(width: 32, height: 24)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(channel.name).lineLimit(1)
+                if let now {
+                    Text(now.title).font(.caption2)
+                        .foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            Spacer()
+            if isFavorite {
+                Image(systemName: "star.fill").foregroundStyle(.yellow).font(.caption)
+            }
+        }
+        .task(id: channel.id) {
+            guard let server else { return }
+            await guide.load(channel, from: server, debounce: .milliseconds(400))
+        }
+        .help(now.map { "\($0.title)\n\($0.summary)" } ?? "")
+    }
+}
+
 /// Now and next, from the channel's short EPG. Live TV needs the current programme's
-/// progress more than it needs a full grid, so that is all this shows.
+/// progress more than it needs a full grid, so that is all this shows. It reads the guide
+/// itself, like ChannelRow, so ContentView never observes `listings`.
 // ponytail: the app logs "reentrant operation in its NSTableView delegate" at startup.
 // Verified it is not ours — it still fires with the row EPG task and the deferred
 // selection writes removed, so it comes from SwiftUI's own List bookkeeping. Harmless
 // today; revisit if a future macOS turns it into the promised assert.
 struct GuideView: View {
-    let programmes: [Programme]
+    let guide: Guide
+    let channel: Channel
 
     var body: some View {
         // Re-renders every 30s so "now" and the progress bar don't go stale while watching.
-        TimelineView(.periodic(from: .now, by: 30)) { _ in content }
+        TimelineView(.periodic(from: .now, by: 30)) { _ in
+            let programmes = guide.programmes(channel)
+            if !programmes.isEmpty { content(programmes) }
+        }
     }
 
-    private var content: some View {
+    private func content(_ programmes: [Programme]) -> some View {
         let now = programmes.first(where: \.isNow) ?? programmes.first
         return VStack(alignment: .leading, spacing: 2) {
             if let now {

@@ -12,7 +12,7 @@ channel list in a real Mac app, playing in AVKit, VLC, or Infuse.
   with progress for the one playing. Rows fetch their own guide as they scroll
   into view and cache it, so a 5000-channel portal costs a few requests, not 5000
 - **Search and category filter** across the whole channel list
-- **Plays in VLC** — pick a channel and it opens there, with the guide and stream
+- **Plays in VLC** — double-click a channel (or select it and press Return) and it opens there, with the guide and stream
   details staying in Xstream
 - **Export to M3U** — hand your channels to anything that reads a playlist. The
   list's own search and category filters are the picker: export what's visible,
