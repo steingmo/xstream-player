@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:xstream-player}",
+            "name": "Debug Xstream",
+            "target": "Xstream",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Xstream"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:xstream-player}",
+            "name": "Release Xstream",
+            "target": "Xstream",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Xstream"
+        }
+    ]
+}
