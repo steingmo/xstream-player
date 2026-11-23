@@ -12,6 +12,10 @@ channel list in a real Mac app, playing in AVKit, VLC, or Infuse.
   with progress for the one playing. Rows fetch their own guide as they scroll
   into view and cache it, so a 5000-channel portal costs a few requests, not 5000
 - **Search and category filter** across the whole channel list
+- **Trim the list per source** — when adding or editing a server (right-click it,
+  or the filter button above the list), switch Live TV or Movies off entirely,
+  untick the categories you never watch, and drag the rest into your own order.
+  Turned-off sections aren't even downloaded. TV series aren't loaded yet
 - **Plays in VLC** — double-click a channel (or select it and press Return) and it opens there, with the guide and stream
   details staying in Xstream
 - **Export to M3U** — hand your channels to anything that reads a playlist. The

@@ -67,4 +67,38 @@ assert(trickyBack[0].name == "Ch \" One", trickyBack[0].name)   // parser trims 
 // And stable from there — a second trip changes nothing.
 assert(parseM3U(exportM3U(trickyBack), base: nil) == trickyBack)
 
+// Per-source filter: sections, hidden categories, order.
+func ch(_ id: String, _ group: String) -> Channel {
+    Channel(id: id, name: id, group: group, logo: nil, url: URL(string: "http://x/\(id)")!)
+}
+let mixed = [ch("live-1", "News"), ch("live-2", "Sport"), ch("vod-3", "Movies · Action"), ch("m3u-0", "News")]
+var f = SourceFilter()
+assert(f.apply(mixed) == mixed, "default filter must show everything")
+f.movies = false
+assert(f.apply(mixed).map(\.id) == ["live-1", "live-2", "m3u-0"])
+f.movies = true; f.live = false
+assert(f.apply(mixed).map(\.id) == ["vod-3", "m3u-0"], "M3U entries are not a section")
+f.live = true; f.hidden = ["Sport"]
+assert(f.apply(mixed).map(\.id) == ["live-1", "vod-3", "m3u-0"])
+// showNew off: a category added after the last save stays hidden.
+f.known = ["News", "Sport", "Movies · Action"]; f.showNew = false
+assert(f.isVisible(group: "News") && !f.isVisible(group: "Kids"))
+f.showNew = true
+assert(f.isVisible(group: "Kids"))
+
+assert(SourceFilter().sorted(["b", "A", "c", "b"]) == ["A", "b", "c"], "A–Z, deduplicated")
+f.order = ["Sport", "Gone", "News", "Sport"]
+assert(f.sorted(["Arts", "News", "Sport", "Zoo"]) == ["Sport", "News", "Arts", "Zoo"],
+       f.sorted(["Arts", "News", "Sport", "Zoo"]).joined(separator: ","))
+
+// Older sources.json files have no filter, and older filters may lack newer keys.
+let oldJSON = #"[{"id":"7D3F7A43-1A7C-4C1E-9C55-2B0E2F1E7A11","name":"p","kind":{"m3u":{"path":"/x"}}}]"#
+let old = try! JSONDecoder().decode([Source].self, from: Data(oldJSON.utf8))
+assert(old[0].filter == nil)
+let partial = try! JSONDecoder().decode(SourceFilter.self, from: Data(#"{"movies":false}"#.utf8))
+assert(!partial.movies && partial.live && partial.showNew && partial.hidden.isEmpty)
+var withFilter = old[0]; withFilter.filter = f
+let back = try! JSONDecoder().decode(Source.self, from: JSONEncoder().encode(withFilter))
+assert(back == withFilter, "filter must round-trip")
+
 print("ok — \(cs.count) channels parsed, all checks passed")
