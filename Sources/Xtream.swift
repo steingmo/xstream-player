@@ -37,6 +37,61 @@ struct Source: Codable, Hashable, Identifiable {
     var id = UUID()
     var name: String
     var kind: SourceKind
+    /// Optional so sources.json files written before filters existed still decode.
+    var filter: SourceFilter?
+}
+
+/// Per-source choice of what the channel list shows: whole sections on or off, which
+/// categories are hidden, and the order categories appear in.
+struct SourceFilter: Codable, Hashable {
+    var live = true
+    var movies = true
+    /// Groups (Channel.group) the user unticked.
+    var hidden: Set<String> = []
+    /// Every group the server had when the filter was last saved. With `showNew` off, a
+    /// group outside this set is treated as hidden, so "only these three" stays three.
+    var known: Set<String> = []
+    var showNew = true
+    /// The user's category order. Groups not in it follow, A–Z. Empty means plain A–Z.
+    var order: [String] = []
+
+    static let moviePrefix = "Movies · "
+
+    init() {}
+
+    // Hand-written so a field added later doesn't make older saved filters undecodable.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        live = try c.decodeIfPresent(Bool.self, forKey: .live) ?? true
+        movies = try c.decodeIfPresent(Bool.self, forKey: .movies) ?? true
+        hidden = try c.decodeIfPresent(Set<String>.self, forKey: .hidden) ?? []
+        known = try c.decodeIfPresent(Set<String>.self, forKey: .known) ?? []
+        showNew = try c.decodeIfPresent(Bool.self, forKey: .showNew) ?? true
+        order = try c.decodeIfPresent([String].self, forKey: .order) ?? []
+    }
+
+    func isVisible(group: String) -> Bool {
+        if hidden.contains(group) { return false }
+        return showNew || known.isEmpty || known.contains(group)
+    }
+
+    func includes(_ c: Channel) -> Bool {
+        if !live && c.id.hasPrefix("live-") { return false }
+        if !movies && c.id.hasPrefix("vod-") { return false }
+        return isVisible(group: c.group)
+    }
+
+    func apply(_ channels: [Channel]) -> [Channel] { channels.filter(includes) }
+
+    /// `groups` in the user's order, then everything else A–Z. Duplicates collapse.
+    func sorted(_ groups: [String]) -> [String] {
+        let all = Set(groups)
+        var seen = Set<String>()
+        let pinned = order.filter { all.contains($0) && seen.insert($0).inserted }
+        let rest = all.subtracting(seen)
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        return pinned + rest
+    }
 }
 
 /// Xtream panels base64-encode EPG text, but not all of them do it consistently —
@@ -112,19 +167,33 @@ enum Xtream {
         throw Err("Unexpected reply to \(action) — wrong credentials or not an Xtream server?")
     }
 
-    /// Live channels + VOD movies. Series are skipped: each one needs its own episode fetch.
-    static func channels(_ s: Server) async throws -> [Channel] {
-        async let liveCats = rows(s, "get_live_categories")
-        async let live = rows(s, "get_live_streams")
-        async let vodCats = rows(s, "get_vod_categories")
-        async let vod = rows(s, "get_vod_streams")
+    private static func names(_ rs: [[String: Any]]) -> [String: String] {
+        Dictionary(rs.compactMap { r -> (String, String)? in
+            guard let i = string(r, "category_id"), let n = string(r, "category_name") else { return nil }
+            return (i, n)
+        }, uniquingKeysWith: { a, _ in a })
+    }
 
-        func names(_ rs: [[String: Any]]) -> [String: String] {
-            Dictionary(rs.compactMap { r -> (String, String)? in
-                guard let i = string(r, "category_id"), let n = string(r, "category_name") else { return nil }
-                return (i, n)
-            }, uniquingKeysWith: { a, _ in a })
+    /// Category names as the channel list groups them, in the provider's order. Two small
+    /// requests, so the server sheet can offer them before any stream list is downloaded.
+    static func categories(_ s: Server) async throws -> [String] {
+        async let liveCats = rows(s, "get_live_categories")
+        async let vodCats = rows(s, "get_vod_categories")
+        func list(_ rs: [[String: Any]], _ prefix: String) -> [String] {
+            rs.compactMap { string($0, "category_name").map { prefix + $0 } }
         }
+        return list(try await liveCats, "") + list(try await vodCats, SourceFilter.moviePrefix)
+    }
+
+    /// Live channels + VOD movies. Series are skipped: each one needs its own episode fetch.
+    /// A section that is switched off is not downloaded at all; the VOD list is the big one.
+    static func channels(_ s: Server, live wantLive: Bool = true,
+                         movies wantMovies: Bool = true) async throws -> [Channel] {
+        let none: [[String: Any]] = []
+        async let liveCats = wantLive ? rows(s, "get_live_categories") : none
+        async let live = wantLive ? rows(s, "get_live_streams") : none
+        async let vodCats = wantMovies ? rows(s, "get_vod_categories") : none
+        async let vod = wantMovies ? rows(s, "get_vod_streams") : none
 
         let b = base(s), u = esc(s.username), p = esc(s.password)
         var out: [Channel] = []
@@ -147,7 +216,7 @@ enum Xtream {
             let ext = string(r, "container_extension") ?? "mp4"
             guard let url = URL(string: "\(b)/movie/\(u)/\(p)/\(id).\(ext)") else { continue }
             out.append(Channel(id: "vod-\(id)", name: name,
-                               group: "Movies · " + (vc[string(r, "category_id") ?? ""] ?? "All"),
+                               group: SourceFilter.moviePrefix + (vc[string(r, "category_id") ?? ""] ?? "All"),
                                logo: URL(string: string(r, "stream_icon") ?? ""), url: url))
         }
         return out

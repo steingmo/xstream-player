@@ -29,15 +29,16 @@ struct XstreamApp: App {
 struct ContentView: View {
     @State private var sources = Store.load()
     @State private var selected: Source.ID?
+    /// Everything the server sent; `channels` is this after the source's filter.
+    @State private var allChannels: [Channel] = []
     @State private var channels: [Channel] = []
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
     @State private var group = "All"
     @State private var playing: Channel?
-    @State private var addingServer = false
-    @State private var draftName = ""
-    @State private var draft = Server()
+    /// The source in the add/edit sheet. New sources are not in `sources` until saved.
+    @State private var editing: Source?
     @State private var importing = false
     @State private var playError: String?
     @State private var export: M3UFile?
@@ -48,7 +49,25 @@ struct ContentView: View {
     private static let favoritesGroup = "\u{2605} Favorites"
 
     private var groups: [String] {
-        ["All", Self.favoritesGroup] + Set(channels.map(\.group)).sorted()
+        ["All", Self.favoritesGroup] + currentFilter.sorted(channels.map(\.group))
+    }
+
+    private var currentSource: Source? { sources.first(where: { $0.id == selected }) }
+
+    private var currentFilter: SourceFilter { currentSource?.filter ?? SourceFilter() }
+
+    /// What forces a re-download: another source, new credentials, or a section switched
+    /// on or off. Hiding or reordering categories only re-filters what is already loaded.
+    private struct LoadKey: Hashable {
+        let id: Source.ID?
+        let kind: SourceKind?
+        let live: Bool
+        let movies: Bool
+    }
+
+    private var loadKey: LoadKey {
+        LoadKey(id: selected, kind: currentSource?.kind,
+                live: currentFilter.live, movies: currentFilter.movies)
     }
 
     private var shown: [Channel] {
@@ -105,6 +124,9 @@ struct ContentView: View {
                 }
             }
             .contextMenu(forSelectionType: Source.ID.self) { ids in
+                if ids.count == 1, let s = sources.first(where: { ids.contains($0.id) }) {
+                    Button("Edit…") { editing = s }
+                }
                 Button("Remove", role: .destructive) {
                     sources.removeAll { ids.contains($0.id) }
                     Store.save(sources)
@@ -113,7 +135,7 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 180, ideal: 220)
             .toolbar {
                 Menu {
-                    Button("Xtream Server…") { draft = Server(); draftName = ""; addingServer = true }
+                    Button("Xtream Server…") { editing = Source(name: "", kind: .xtream(Server())) }
                     Button("M3U File…") { importing = true }
                 } label: { Image(systemName: "plus") }
             }
@@ -150,6 +172,11 @@ struct ContentView: View {
             .searchable(text: $query, placement: .toolbar, prompt: "Search channels")
             .navigationSplitViewColumnWidth(min: 240, ideal: 320)
             .toolbar {
+                Button { editing = currentSource } label: {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                }
+                .disabled(currentSource == nil)
+                .help("Choose which sections and categories to show")
                 Menu {
                     Section("URLs include your portal password") {
                         Button("Visible Channels… (\(shown.count))") {
@@ -209,7 +236,8 @@ struct ContentView: View {
             // Deferred: setting selection inside the table's first update is reentrant.
             if selected == nil { Task { selected = sources.first?.id } }
         }
-        .task(id: selected) { await loadSelected() }
+        .task(id: loadKey) { await loadSelected() }
+        .onChange(of: currentFilter) { applyFilter() }
         .task(id: playing?.id) { await loadEPG() }
         .fileExporter(isPresented: Binding(get: { export != nil }, set: { if !$0 { export = nil } }),
                       document: export, contentType: .m3uPlaylist, defaultFilename: exportName) { _ in
@@ -219,22 +247,8 @@ struct ContentView: View {
             guard let url = try? result.get() else { return }
             add(Source(name: url.lastPathComponent, kind: .m3u(path: url.path)))
         }
-        .sheet(isPresented: $addingServer) {
-            Form {
-                TextField("Name", text: $draftName, prompt: Text("My provider"))
-                TextField("Server", text: $draft.host, prompt: Text("http://host:port"))
-                TextField("Username", text: $draft.username)
-                SecureField("Password", text: $draft.password)
-                HStack {
-                    Spacer()
-                    Button("Cancel") { addingServer = false }
-                    Button("Add") {
-                        add(Source(name: draftName.isEmpty ? draft.host : draftName, kind: .xtream(draft)))
-                        addingServer = false
-                    }.keyboardShortcut(.defaultAction).disabled(draft.host.isEmpty)
-                }
-            }
-            .padding().frame(width: 380)
+        .sheet(item: $editing) { source in
+            SourceEditor(source: source) { save($0) }
         }
     }
 
@@ -243,6 +257,23 @@ struct ContentView: View {
         Store.save(sources)
         selected = s.id
     }
+
+    private func save(_ s: Source) {
+        guard let i = sources.firstIndex(where: { $0.id == s.id }) else { return add(s) }
+        sources[i] = s
+        Store.save(sources)
+    }
+
+    private func applyFilter() {
+        channels = currentFilter.apply(allChannels)
+        if !groups.contains(group) { group = "All" }
+        if let playing, !channels.contains(playing) { self.playing = nil }
+        if error == nil || error == Self.allHidden {
+            error = !allChannels.isEmpty && channels.isEmpty ? Self.allHidden : nil
+        }
+    }
+
+    private static let allHidden = "Every category is hidden. Use the filter button to show some."
 
     private func play(_ c: Channel) {
         playing = c
@@ -257,23 +288,226 @@ struct ContentView: View {
 
     private func loadSelected() async {
         // Reset before the guard: removing the selected source must empty the list too.
-        error = nil; channels = []; group = "All"; playing = nil; guide.clear()
-        guard let source = sources.first(where: { $0.id == selected }) else { return }
+        error = nil; allChannels = []; channels = []; group = "All"; playing = nil; guide.clear()
+        guard let source = currentSource else { return }
+        let filter = source.filter ?? SourceFilter()
         loading = true
         defer { loading = false }
         do {
             switch source.kind {
             case .xtream(let s):
-                channels = try await Xtream.channels(s)
+                allChannels = try await Xtream.channels(s, live: filter.live, movies: filter.movies)
             case .m3u(let path):
                 let url = URL(fileURLWithPath: path)
-                channels = parseM3U(try String(contentsOf: url, encoding: .utf8), base: url)
+                allChannels = parseM3U(try String(contentsOf: url, encoding: .utf8), base: url)
             }
-            if channels.isEmpty, !Task.isCancelled { error = "No channels found." }
+            if Task.isCancelled { return }
+            if allChannels.isEmpty {
+                error = filter.live || filter.movies ? "No channels found."
+                    : "Live TV and Movies are both switched off. Use the filter button to turn one on."
+            } else {
+                applyFilter()
+            }
         } catch {
             // A superseded load cancels its URLSession tasks; that is not a failure to report.
             if !Task.isCancelled { self.error = error.localizedDescription }
         }
+    }
+}
+
+/// Add or edit a source: credentials for an Xtream server, then which sections and
+/// categories the channel list shows and in what order. Everything saves with the source.
+struct SourceEditor: View {
+    let onSave: (Source) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var source: Source
+    @State private var server: Server
+    @State private var filter: SourceFilter
+    private let isXtream: Bool
+    /// Fixed at open, so the button doesn't flip from Add to Save while typing.
+    private let isNew: Bool
+
+    /// Every category the source has, in display order. Empty until loaded.
+    @State private var ordered: [String] = []
+    /// The provider's own order, for the "Provider order" sort.
+    @State private var provider: [String] = []
+    @State private var orderChanged = false
+    @State private var loadingCategories = false
+    @State private var categoryError: String?
+    @State private var categoryQuery = ""
+
+    init(source: Source, onSave: @escaping (Source) -> Void) {
+        self.onSave = onSave
+        _source = State(initialValue: source)
+        _filter = State(initialValue: source.filter ?? SourceFilter())
+        if case .xtream(let s) = source.kind {
+            _server = State(initialValue: s); isXtream = true; isNew = s.host.isEmpty
+        } else {
+            _server = State(initialValue: Server()); isXtream = false; isNew = false
+        }
+    }
+
+    private func isMovie(_ g: String) -> Bool { g.hasPrefix(SourceFilter.moviePrefix) }
+
+    /// Categories in the list right now: switched-off sections and the search filter out.
+    private var listed: [String] {
+        ordered.filter { g in
+            (!isXtream || (isMovie(g) ? filter.movies : filter.live))
+                && (categoryQuery.isEmpty || g.localizedCaseInsensitiveContains(categoryQuery))
+        }
+    }
+
+    private func shown(_ g: String) -> Binding<Bool> {
+        Binding(get: { !filter.hidden.contains(g) }, set: { on in
+            if on { filter.hidden.remove(g) } else { filter.hidden.insert(g) }
+        })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Form {
+                TextField("Name", text: $source.name, prompt: Text(isXtream ? "My provider" : "Playlist"))
+                if isXtream {
+                    TextField("Server", text: $server.host, prompt: Text("http://host:port"))
+                    TextField("Username", text: $server.username)
+                    SecureField("Password", text: $server.password)
+                }
+            }
+
+            if isXtream {
+                GroupBox("Sections") {
+                    HStack(spacing: 16) {
+                        Toggle("Live TV", isOn: $filter.live)
+                        Toggle("Movies", isOn: $filter.movies)
+                        // Series are never downloaded (each needs its own episode fetch),
+                        // so this is always off. It is here so nobody hunts for it.
+                        Toggle("TV Series", isOn: .constant(false)).disabled(true)
+                            .help("Xstream doesn't load TV series yet, so they never fill the list.")
+                        Spacer()
+                    }
+                    .padding(4)
+                }
+            }
+
+            GroupBox("Categories") {
+                VStack(alignment: .leading, spacing: 8) {
+                    if ordered.isEmpty {
+                        HStack {
+                            Button(loadingCategories ? "Loading…" : "Load Categories") {
+                                Task { await loadCategories() }
+                            }
+                            .disabled(loadingCategories || (isXtream && server.host.isEmpty))
+                            if loadingCategories { ProgressView().controlSize(.small) }
+                            Spacer()
+                        }
+                        if let categoryError {
+                            Text(categoryError).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                        } else {
+                            Text("Untick categories you don't want, and drag to reorder them.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    } else {
+                        HStack {
+                            TextField("Search categories", text: $categoryQuery)
+                                .textFieldStyle(.roundedBorder)
+                            Button("Show All") { filter.hidden.subtract(listed) }
+                            Button("Hide All") { filter.hidden.formUnion(listed) }
+                            Menu("Sort") {
+                                Button("A to Z") {
+                                    ordered = SourceFilter().sorted(ordered)
+                                    filter.order = []; orderChanged = false
+                                }
+                                Button("Provider Order") { ordered = provider; orderChanged = true }
+                            }
+                            .fixedSize()
+                        }
+                        List {
+                            ForEach(listed, id: \.self) { g in
+                                Toggle(g, isOn: shown(g))
+                            }
+                            .onMove(perform: move)
+                        }
+                        .frame(minHeight: 240)
+                        HStack {
+                            Text("\(listed.filter { !filter.hidden.contains($0) }.count) of \(listed.count) shown")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Toggle("Show new categories automatically", isOn: $filter.showNew)
+                                .font(.caption)
+                                .help("Off: categories the provider adds later stay hidden until you tick them here.")
+                        }
+                    }
+                }
+                .padding(4)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button(isNew ? "Add" : "Save") { save() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isXtream && server.host.isEmpty)
+            }
+        }
+        .padding()
+        .frame(width: 500)
+        .task {
+            // An existing source can show its categories straight away; a new server
+            // waits for the button, since its address is still being typed.
+            if !isXtream || !server.host.isEmpty { await loadCategories() }
+        }
+    }
+
+    /// Dragging works on the filtered list, so permute those entries within the slots
+    /// they already hold in the full list; hidden-by-search categories stay put.
+    private func move(from: IndexSet, to: Int) {
+        var moved = listed
+        moved.move(fromOffsets: from, toOffset: to)
+        let members = Set(moved)
+        let slots = ordered.indices.filter { members.contains(ordered[$0]) }
+        for (i, g) in zip(slots, moved) { ordered[i] = g }
+        orderChanged = true
+    }
+
+    private func loadCategories() async {
+        loadingCategories = true
+        categoryError = nil
+        defer { loadingCategories = false }
+        do {
+            var found: [String]
+            switch source.kind {
+            case .xtream:
+                found = try await Xtream.categories(server)
+            case .m3u(let path):
+                let url = URL(fileURLWithPath: path)
+                found = parseM3U(try String(contentsOf: url, encoding: .utf8), base: url).map(\.group)
+            }
+            var seen = Set<String>()
+            found = found.filter { seen.insert($0).inserted }
+            if found.isEmpty { categoryError = "No categories found."; return }
+            provider = found
+            ordered = filter.sorted(found)
+        } catch {
+            if !Task.isCancelled { categoryError = error.localizedDescription }
+        }
+    }
+
+    private func save() {
+        if orderChanged { filter.order = ordered }
+        if !ordered.isEmpty {
+            // What the server has now becomes "known"; ticks for categories it dropped go.
+            filter.known = Set(ordered)
+            filter.hidden.formIntersection(filter.known)
+        }
+        if isXtream {
+            source.kind = .xtream(server)
+            if source.name.isEmpty { source.name = server.host }
+        }
+        source.filter = filter
+        onSave(source)
+        dismiss()
     }
 }
 
