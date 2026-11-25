@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Model
 
-struct Channel: Identifiable, Hashable {
+struct Channel: Identifiable, Hashable, Sendable {
     let id: String
     let name: String
     let group: String
@@ -43,7 +43,7 @@ struct Source: Codable, Hashable, Identifiable {
 
 /// Per-source choice of what the channel list shows: whole sections on or off, which
 /// categories are hidden, and the order categories appear in.
-struct SourceFilter: Codable, Hashable {
+struct SourceFilter: Codable, Hashable, Sendable {
     var live = true
     var movies = true
     /// Groups (Channel.group) the user unticked.
@@ -91,6 +91,59 @@ struct SourceFilter: Codable, Hashable {
         let rest = all.subtracting(seen)
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         return pinned + rest
+    }
+}
+
+/// Pre-indexed view of a source's visible channels so switching categories, looking up a
+/// selection, and searching don't rescan 30k channels on every SwiftUI body render.
+struct ChannelIndex: Equatable, Sendable {
+    static let allGroup = "All"
+    static let favoritesGroup = "\u{2605} Favorites"
+
+    let channels: [Channel]
+    let groups: [String]
+    let byGroup: [String: [Channel]]
+    let byID: [Channel.ID: Channel]
+
+    static let empty = ChannelIndex(channels: [], filter: SourceFilter())
+
+    init(channels: [Channel], filter: SourceFilter) {
+        self.channels = channels
+        var grouped: [String: [Channel]] = [:]
+        var indexed: [Channel.ID: Channel] = Dictionary(minimumCapacity: channels.count)
+        for c in channels {
+            grouped[c.group, default: []].append(c)
+            if indexed[c.id] == nil { indexed[c.id] = c }
+        }
+        self.byGroup = grouped
+        self.byID = indexed
+        self.groups = [Self.allGroup, Self.favoritesGroup] + filter.sorted(Array(grouped.keys))
+    }
+
+    /// The channels in `group` before any search query is applied — O(1) for every group.
+    func base(group: String, favorites: [Channel]) -> [Channel] {
+        switch group {
+        case Self.allGroup: return channels
+        case Self.favoritesGroup: return favorites
+        default: return byGroup[group] ?? []
+        }
+    }
+
+    func filter(group: String, query: String, favorites: [Channel]) -> [Channel] {
+        Self.filter(base(group: group, favorites: favorites), query: query)
+    }
+
+    /// Filters a pre-selected pool by `query`. Checks task cancellation periodically so a
+    /// superseded search over tens of thousands of channels exits early.
+    static func filter(_ pool: [Channel], query: String) -> [Channel] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return pool }
+        var out: [Channel] = []
+        for (i, c) in pool.enumerated() {
+            if i & 1023 == 0 && Task.isCancelled { return [] }
+            if c.name.localizedCaseInsensitiveContains(q) { out.append(c) }
+        }
+        return out
     }
 }
 
@@ -196,10 +249,15 @@ enum Xtream {
         async let vod = wantMovies ? rows(s, "get_vod_streams") : none
 
         let b = base(s), u = esc(s.username), p = esc(s.password)
-        var out: [Channel] = []
-
         let lc = names(try await liveCats)
-        for r in try await live {
+        let liveRows = try await live
+        let vc = names(try await vodCats)
+        let vodRows = try await vod
+
+        var out: [Channel] = []
+        out.reserveCapacity(liveRows.count + vodRows.count)
+
+        for r in liveRows {
             guard let id = string(r, "stream_id"), let name = string(r, "name"),
                   // .m3u8 rather than .ts: both work in VLC, and HLS survives a flaky
                   // connection better. Panels with HLS disabled would need .ts here.
@@ -210,8 +268,7 @@ enum Xtream {
                                streamID: id))
         }
 
-        let vc = names(try await vodCats)
-        for r in try await vod {
+        for r in vodRows {
             guard let id = string(r, "stream_id"), let name = string(r, "name") else { continue }
             let ext = string(r, "container_extension") ?? "mp4"
             guard let url = URL(string: "\(b)/movie/\(u)/\(p)/\(id).\(ext)") else { continue }
@@ -298,6 +355,19 @@ func parseM3U(_ text: String, base: URL? = nil) -> [Channel] {
         }
     }
     return out
+}
+
+/// Reads and parses a local M3U off the main actor so multi-megabyte playlists don't stall UI.
+func loadM3U(path: String) async throws -> [Channel] {
+    let url = URL(fileURLWithPath: path)
+    let task = Task.detached(priority: .userInitiated) {
+        parseM3U(try String(contentsOf: url, encoding: .utf8), base: url)
+    }
+    return try await withTaskCancellationHandler {
+        try await task.value
+    } onCancel: {
+        task.cancel()
+    }
 }
 
 // MARK: - M3U export

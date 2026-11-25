@@ -101,4 +101,43 @@ var withFilter = old[0]; withFilter.filter = f
 let back = try! JSONDecoder().decode(Source.self, from: JSONEncoder().encode(withFilter))
 assert(back == withFilter, "filter must round-trip")
 
+// ChannelIndex: pre-indexed groups, O(1) lookup, category filtering, and search.
+let idxFilter = {
+    var sf = SourceFilter()
+    sf.order = ["Sport", "News"]
+    return sf
+}()
+let dup = Channel(id: "live-1", name: "Duplicate", group: "News", logo: nil, url: URL(string: "http://x/dup")!)
+let idxChannels = [
+    Channel(id: "live-1", name: "BBC News", group: "News", logo: nil, url: URL(string: "http://x/1")!),
+    dup,
+    Channel(id: "live-2", name: "Sky Sports HD", group: "Sport", logo: nil, url: URL(string: "http://x/2")!),
+    Channel(id: "vod-3", name: "Movies · Action Hero", group: "Movies · Action", logo: nil, url: URL(string: "http://x/3")!),
+]
+let idx = ChannelIndex(channels: idxChannels, filter: idxFilter)
+assert(idx.groups == [ChannelIndex.allGroup, ChannelIndex.favoritesGroup, "Sport", "News", "Movies · Action"],
+       idx.groups.joined(separator: ","))
+assert(idx.byID["live-1"]?.name == "BBC News", "first entry wins on duplicate id")
+assert(idx.byID["missing"] == nil)
+assert(idx.base(group: ChannelIndex.allGroup, favorites: []).count == 4)
+assert(idx.base(group: "Sport", favorites: []).map(\.id) == ["live-2"])
+assert(idx.base(group: "Unknown", favorites: []).isEmpty)
+let favs = [idxChannels[0], idxChannels[2]]
+assert(idx.base(group: ChannelIndex.favoritesGroup, favorites: favs).map(\.id) == ["live-1", "live-2"])
+assert(idx.filter(group: ChannelIndex.allGroup, query: "  sports  ", favorites: favs).map(\.id) == ["live-2"])
+assert(idx.filter(group: ChannelIndex.favoritesGroup, query: "bbc", favorites: favs).map(\.id) == ["live-1"])
+assert(idx.filter(group: "News", query: "   ", favorites: favs).count == 2)
+
+// Large-portal index & filter sanity check (30k channels).
+let big: [Channel] = (0..<30_000).map { i in
+    Channel(id: "live-\(i)", name: i == 19_999 ? "Kringvarp Føroya HD" : "Channel \(i)",
+            group: "Group \(i % 50)", logo: nil, url: URL(string: "http://x/\(i)")!)
+}
+let bigIdx = ChannelIndex(channels: big, filter: SourceFilter())
+assert(bigIdx.groups.count == 52)
+assert(bigIdx.byID["live-19999"]?.name == "Kringvarp Føroya HD")
+assert(bigIdx.byGroup["Group 49"]?.count == 600)
+assert(bigIdx.filter(group: ChannelIndex.allGroup, query: "kringvarp", favorites: []).map(\.id) == ["live-19999"])
+assert(bigIdx.filter(group: "Group 49", query: "føroya", favorites: []).map(\.id) == ["live-19999"])
+
 print("ok — \(cs.count) channels parsed, all checks passed")

@@ -29,13 +29,18 @@ struct XstreamApp: App {
 struct ContentView: View {
     @State private var sources = Store.load()
     @State private var selected: Source.ID?
-    /// Everything the server sent; `channels` is this after the source's filter.
+    /// Everything the server sent; `index` holds this after the source's filter.
     @State private var allChannels: [Channel] = []
-    @State private var channels: [Channel] = []
+    @State private var index = ChannelIndex.empty
+    @State private var shown: [Channel] = []
+    @State private var favoriteNames: Set<String> = []
+    @State private var favoriteChannels: [Channel] = []
+    @State private var searchGeneration = 0
+    @State private var lastSearchedQuery = ""
     @State private var loading = false
     @State private var error: String?
     @State private var query = ""
-    @State private var group = "All"
+    @State private var group = ChannelIndex.allGroup
     @State private var playing: Channel?
     /// The source in the add/edit sheet. New sources are not in `sources` until saved.
     @State private var editing: Source?
@@ -45,12 +50,6 @@ struct ContentView: View {
     @State private var exportName = "channels"
     @State private var favorites = Favorites.load()
     @State private var guide = Guide()
-
-    private static let favoritesGroup = "\u{2605} Favorites"
-
-    private var groups: [String] {
-        ["All", Self.favoritesGroup] + currentFilter.sorted(channels.map(\.group))
-    }
 
     private var currentSource: Source? { sources.first(where: { $0.id == selected }) }
 
@@ -70,16 +69,16 @@ struct ContentView: View {
                 live: currentFilter.live, movies: currentFilter.movies)
     }
 
-    private var shown: [Channel] {
-        channels.filter { c in
-            let inGroup: Bool
-            switch group {
-            case "All": inGroup = true
-            case Self.favoritesGroup: inGroup = isFavorite(c)
-            default: inGroup = c.group == group
-            }
-            return inGroup && (query.isEmpty || c.name.localizedCaseInsensitiveContains(query))
-        }
+    /// Drives cached `shown` updates so body renders (selection, play errors, sheets) never
+    /// rescan tens of thousands of channels.
+    private struct SearchKey: Hashable {
+        let generation: Int
+        let group: String
+        let query: String
+    }
+
+    private var searchKey: SearchKey {
+        SearchKey(generation: searchGeneration, group: group, query: query)
     }
 
     /// The Xtream server behind the selected source, if it is one — EPG needs it.
@@ -88,8 +87,6 @@ struct ContentView: View {
               case .xtream(let server) = kind else { return nil }
         return server
     }
-
-    private var favoriteChannels: [Channel] { channels.filter(isFavorite) }
 
     private var sourceName: String {
         sources.first(where: { $0.id == selected })?.name ?? "channels"
@@ -103,8 +100,19 @@ struct ContentView: View {
     }
 
     private func isFavorite(_ c: Channel) -> Bool {
-        guard let selected else { return false }
-        return favorites.contains(Favorites.key(selected, c))
+        favoriteNames.contains(c.name)
+    }
+
+    private func rebuildFavorites() {
+        guard let selected else {
+            favoriteNames = []
+            favoriteChannels = []
+            return
+        }
+        let prefix = "\(selected.uuidString)|"
+        let names = Set(favorites.compactMap { $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : nil })
+        favoriteNames = names
+        favoriteChannels = names.isEmpty ? [] : index.channels.filter { names.contains($0.name) }
     }
 
     private func toggleFavorite(_ c: Channel) {
@@ -112,6 +120,13 @@ struct ContentView: View {
         let key = Favorites.key(selected, c)
         if favorites.contains(key) { favorites.remove(key) } else { favorites.insert(key) }
         Favorites.save(favorites)
+        rebuildFavorites()
+        if group == ChannelIndex.favoritesGroup {
+            if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                shown = favoriteChannels
+            }
+            searchGeneration += 1
+        }
     }
 
     var body: some View {
@@ -144,7 +159,7 @@ struct ContentView: View {
                 if loading { ProgressView().padding() }
                 if let error { Text(error).foregroundStyle(.red).padding(.horizontal).textSelection(.enabled) }
                 Picker("", selection: $group) {
-                    ForEach(groups, id: \.self) { Text($0).tag($0) }
+                    ForEach(index.groups, id: \.self) { Text($0).tag($0) }
                 }
                 .labelsHidden().padding(6)
                 // Selecting only shows the channel; double-click or Return plays it. Playing on
@@ -152,7 +167,7 @@ struct ContentView: View {
                 List(shown, selection: Binding(get: { playing?.id }, set: { id in
                     // Deferred: the setter runs inside the table's selection delegate, and
                     // mutating @State there is reentrant.
-                    let c = shown.first(where: { $0.id == id })
+                    let c = id.flatMap { index.byID[$0] }
                     Task { playing = c; playError = nil }
                 })) { c in
                     ChannelRow(channel: c, guide: guide, server: currentServer,
@@ -160,13 +175,13 @@ struct ContentView: View {
                         .tag(c.id)
                 }
                 .contextMenu(forSelectionType: Channel.ID.self) { ids in
-                    if let c = channels.first(where: { ids.contains($0.id) }) {
+                    if let id = ids.first, let c = index.byID[id] {
                         Button(isFavorite(c) ? "Remove from Favorites" : "Add to Favorites") {
                             toggleFavorite(c)
                         }
                     }
                 } primaryAction: { ids in
-                    if let c = channels.first(where: { ids.contains($0.id) }) { play(c) }
+                    if let id = ids.first, let c = index.byID[id] { play(c) }
                 }
             }
             .searchable(text: $query, placement: .toolbar, prompt: "Search channels")
@@ -186,14 +201,14 @@ struct ContentView: View {
                             beginExport("favorites", favoriteChannels)
                         }
                         .disabled(favoriteChannels.isEmpty)
-                        Button("All Channels… (\(channels.count))") {
-                            beginExport("all", channels)
+                        Button("All Channels… (\(index.channels.count))") {
+                            beginExport("all", index.channels)
                         }
                     }
                 } label: {
                     Image(systemName: "square.and.arrow.up")
                 }
-                .disabled(channels.isEmpty)
+                .disabled(index.channels.isEmpty)
                 .help("Export as an M3U playlist")
             }
         } detail: {
@@ -238,6 +253,12 @@ struct ContentView: View {
         }
         .task(id: loadKey) { await loadSelected() }
         .onChange(of: currentFilter) { applyFilter() }
+        .onChange(of: group) {
+            if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                shown = index.base(group: group, favorites: favoriteChannels)
+            }
+        }
+        .task(id: searchKey) { await updateShown() }
         .task(id: playing?.id) { await loadEPG() }
         .fileExporter(isPresented: Binding(get: { export != nil }, set: { if !$0 { export = nil } }),
                       document: export, contentType: .m3uPlaylist, defaultFilename: exportName) { _ in
@@ -265,12 +286,50 @@ struct ContentView: View {
     }
 
     private func applyFilter() {
-        channels = currentFilter.apply(allChannels)
-        if !groups.contains(group) { group = "All" }
-        if let playing, !channels.contains(playing) { self.playing = nil }
+        let filtered = currentFilter.apply(allChannels)
+        index = ChannelIndex(channels: filtered, filter: currentFilter)
+        rebuildFavorites()
+        if !index.groups.contains(group) { group = ChannelIndex.allGroup }
+        if let playing, index.byID[playing.id] != playing { self.playing = nil }
         if error == nil || error == Self.allHidden {
-            error = !allChannels.isEmpty && channels.isEmpty ? Self.allHidden : nil
+            error = !allChannels.isEmpty && index.channels.isEmpty ? Self.allHidden : nil
         }
+        if query.trimmingCharacters(in: .whitespaces).isEmpty {
+            shown = index.base(group: group, favorites: favoriteChannels)
+        }
+        searchGeneration += 1
+    }
+
+    private func updateShown() async {
+        let pool = index.base(group: group, favorites: favoriteChannels)
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !pool.isEmpty else {
+            shown = pool
+            lastSearchedQuery = query
+            return
+        }
+        // Small categories filter in under a millisecond; large lists debounce keystrokes
+        // and filter off the main thread so typing stays smooth at 20k–50k channels.
+        if pool.count <= 2_000 {
+            shown = ChannelIndex.filter(pool, query: trimmed)
+            lastSearchedQuery = query
+            return
+        }
+        if query != lastSearchedQuery {
+            try? await Task.sleep(for: .milliseconds(120))
+            if Task.isCancelled { return }
+        }
+        let task = Task.detached(priority: .userInitiated) {
+            ChannelIndex.filter(pool, query: trimmed)
+        }
+        let result = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        guard !Task.isCancelled else { return }
+        shown = result
+        lastSearchedQuery = query
     }
 
     private static let allHidden = "Every category is hidden. Use the filter button to show some."
@@ -288,7 +347,8 @@ struct ContentView: View {
 
     private func loadSelected() async {
         // Reset before the guard: removing the selected source must empty the list too.
-        error = nil; allChannels = []; channels = []; group = "All"; playing = nil; guide.clear()
+        error = nil; allChannels = []; index = .empty; favoriteNames = []; favoriteChannels = []
+        shown = []; group = ChannelIndex.allGroup; playing = nil; guide.clear(); searchGeneration += 1
         guard let source = currentSource else { return }
         let filter = source.filter ?? SourceFilter()
         loading = true
@@ -298,8 +358,7 @@ struct ContentView: View {
             case .xtream(let s):
                 allChannels = try await Xtream.channels(s, live: filter.live, movies: filter.movies)
             case .m3u(let path):
-                let url = URL(fileURLWithPath: path)
-                allChannels = parseM3U(try String(contentsOf: url, encoding: .utf8), base: url)
+                allChannels = try await loadM3U(path: path)
             }
             if Task.isCancelled { return }
             if allChannels.isEmpty {
@@ -481,8 +540,7 @@ struct SourceEditor: View {
             case .xtream:
                 found = try await Xtream.categories(server)
             case .m3u(let path):
-                let url = URL(fileURLWithPath: path)
-                found = parseM3U(try String(contentsOf: url, encoding: .utf8), base: url).map(\.group)
+                found = try await loadM3U(path: path).map(\.group)
             }
             var seen = Set<String>()
             found = found.filter { seen.insert($0).inserted }
