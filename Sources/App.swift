@@ -3,12 +3,35 @@ import Sparkle
 import SwiftUI
 import UniformTypeIdentifiers
 
+@MainActor
+@Observable
+final class PlaybackMenuBridge {
+    var hasActivePlayer = false
+    var isPaused = false
+    var isMuted = false
+    var isTheaterMode = false
+    var isMiniPlayer = false
+    var canZap = false
+    var canRefresh = false
+
+    var onTogglePlayPause: (() -> Void)?
+    var onStop: (() -> Void)?
+    var onToggleMute: (() -> Void)?
+    var onPreviousChannel: (() -> Void)?
+    var onNextChannel: (() -> Void)?
+    var onToggleFullScreen: (() -> Void)?
+    var onToggleMiniPlayer: (() -> Void)?
+    var onToggleDrawer: (() -> Void)?
+    var onRefresh: (() -> Void)?
+}
+
 @main
 struct XstreamApp: App {
     // Sparkle checks the appcast on its own schedule; this also backs the menu item.
     private let updater = SPUStandardUpdaterController(startingUpdater: true,
                                                       updaterDelegate: nil,
                                                       userDriverDelegate: nil)
+    @State private var bridge = PlaybackMenuBridge()
 
     init() {
         // Channel logos rarely carry cache headers, and the default cache is a few MB, so
@@ -17,17 +40,54 @@ struct XstreamApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("Xstream") { ContentView() }
+        WindowGroup("Xstream") { ContentView(bridge: bridge) }
             .defaultSize(width: 1200, height: 720)
             .commands {
                 CommandGroup(after: .appInfo) {
                     Button("Check for Updates…") { updater.updater.checkForUpdates() }
+                }
+                CommandMenu("Playback") {
+                    Button(bridge.isPaused ? "Play" : "Pause") { bridge.onTogglePlayPause?() }
+                        .keyboardShortcut("p", modifiers: .command)
+                        .disabled(!bridge.hasActivePlayer)
+                    Button("Stop") { bridge.onStop?() }
+                        .keyboardShortcut(".", modifiers: .command)
+                        .disabled(!bridge.hasActivePlayer)
+                    Divider()
+                    Button("Previous Channel") { bridge.onPreviousChannel?() }
+                        .keyboardShortcut("[", modifiers: .command)
+                        .disabled(!bridge.canZap)
+                    Button("Next Channel") { bridge.onNextChannel?() }
+                        .keyboardShortcut("]", modifiers: .command)
+                        .disabled(!bridge.canZap)
+                    Divider()
+                    Button(bridge.isMuted ? "Unmute" : "Mute") { bridge.onToggleMute?() }
+                        .keyboardShortcut("m", modifiers: [.command, .shift])
+                        .disabled(!bridge.hasActivePlayer)
+                    Button(bridge.isMiniPlayer ? "Return to Window" : "Floating Mini-Player") {
+                        bridge.onToggleMiniPlayer?()
+                    }
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(!bridge.hasActivePlayer)
+                    Button(bridge.isTheaterMode ? "Exit Fullscreen" : "Fullscreen") {
+                        bridge.onToggleFullScreen?()
+                    }
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
+                    .disabled(!bridge.hasActivePlayer)
+                    Button("Channel Drawer") { bridge.onToggleDrawer?() }
+                        .keyboardShortcut("l", modifiers: .command)
+                        .disabled(!bridge.isTheaterMode)
+                    Divider()
+                    Button("Refresh Source") { bridge.onRefresh?() }
+                        .keyboardShortcut("r", modifiers: .command)
+                        .disabled(!bridge.canRefresh)
                 }
             }
     }
 }
 
 struct ContentView: View {
+    let bridge: PlaybackMenuBridge
     @State private var sources = Store.load()
     @State private var selected: Source.ID?
     /// Everything the server sent; `index` holds this after the source's filter.
@@ -49,6 +109,7 @@ struct ContentView: View {
     @State private var playing: Channel?
     @State private var player = PlayerController()
     @State private var theaterMode = false
+    @State private var showFullscreenDrawer = false
     @State private var miniPlayer = false
     @State private var miniWindow = MiniPlayerWindowController()
     @State private var loadedSourceID: Source.ID?
@@ -273,7 +334,9 @@ struct ContentView: View {
                 })) { c in
                     ChannelRow(channel: c, guide: guide, server: currentServer,
                                isFavorite: isFavorite(c),
-                               isPlaying: player.activeChannel?.id == c.id)
+                               isPlaying: player.activeChannel?.id == c.id,
+                               onPlay: { play(c) },
+                               onToggleFavorite: { toggleFavorite(c) })
                         .tag(c.id)
                 }
                 .contextMenu(forSelectionType: Channel.ID.self) { ids in
@@ -296,7 +359,6 @@ struct ContentView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .disabled(currentSource == nil || loading)
-                .keyboardShortcut("r", modifiers: .command)
                 .help("Reload channels, guide, and account info (⌘R)")
                 Menu {
                     Picker("Default Player", selection: $defaultPlayer) {
@@ -339,29 +401,60 @@ struct ContentView: View {
         .toolbar(theaterMode ? .hidden : .visible, for: .windowToolbar)
 
         if theaterMode, let active = player.activeChannel {
-            EmbeddedPlayerView(
-                controller: player,
-                channel: active,
-                theaterMode: $theaterMode,
-                onOpenInVLC: { playInVLC(active) },
-                onToggleFullScreen: toggleFullScreen,
-                onToggleMiniPlayer: toggleMiniPlayer
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .ignoresSafeArea()
+            ZStack(alignment: .leading) {
+                EmbeddedPlayerView(
+                    controller: player,
+                    channel: active,
+                    theaterMode: $theaterMode,
+                    onOpenInVLC: { playInVLC(active) },
+                    onToggleFullScreen: toggleFullScreen,
+                    onToggleMiniPlayer: toggleMiniPlayer,
+                    onPreviousChannel: shown.count > 1 ? { zapChannel(offset: -1) } : nil,
+                    onNextChannel: shown.count > 1 ? { zapChannel(offset: 1) } : nil,
+                    onToggleDrawer: {
+                        withAnimation(.easeInOut(duration: 0.2)) { showFullscreenDrawer.toggle() }
+                    }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+
+                if showFullscreenDrawer {
+                    Color.black.opacity(0.25)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.2)) { showFullscreenDrawer = false }
+                        }
+                    fullscreenChannelDrawer
+                        .transition(.move(edge: .leading))
+                }
+            }
         }
         }
         .onAppear {
             // Deferred: setting selection inside the table's first update is reentrant.
             if selected == nil { Task { selected = sources.first?.id } }
+            wireMenuBridge()
+            syncMenuBridge()
         }
         .onChange(of: player.activeChannel) { _, active in
             if active == nil {
                 closeMiniPlayer()
+                showFullscreenDrawer = false
             } else if miniPlayer, let active {
                 miniWindow.update { miniPlayerContent(for: active) }
             }
+            syncMenuBridge()
         }
+        .onChange(of: player.isPaused) { syncMenuBridge() }
+        .onChange(of: player.isMuted) { syncMenuBridge() }
+        .onChange(of: theaterMode) { _, on in
+            if !on { showFullscreenDrawer = false }
+            syncMenuBridge()
+        }
+        .onChange(of: miniPlayer) { syncMenuBridge() }
+        .onChange(of: shown.count) { syncMenuBridge() }
+        .onChange(of: loading) { syncMenuBridge() }
+        .onChange(of: selected) { syncMenuBridge() }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { note in
             if theaterMode {
                 theaterMode = false
@@ -525,7 +618,9 @@ struct ContentView: View {
                         theaterMode: $theaterMode,
                         onOpenInVLC: { playInVLC(active) },
                         onToggleFullScreen: toggleFullScreen,
-                        onToggleMiniPlayer: toggleMiniPlayer
+                        onToggleMiniPlayer: toggleMiniPlayer,
+                        onPreviousChannel: shown.count > 1 ? { zapChannel(offset: -1) } : nil,
+                        onNextChannel: shown.count > 1 ? { zapChannel(offset: 1) } : nil
                     )
                     .frame(maxWidth: .infinity)
                     .aspectRatio(16 / 9, contentMode: .fit)
@@ -565,6 +660,8 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        } else if sources.isEmpty {
+            welcomeView
         } else {
             ContentUnavailableView(
                 "No channel selected",
@@ -573,6 +670,131 @@ struct ContentView: View {
                     ? "Double-click a channel to watch it here, or right-click to open in VLC."
                     : "Double-click a channel to open it in VLC, or right-click to play in Xstream.")
             )
+        }
+    }
+
+    private var welcomeView: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "play.tv")
+                .font(.system(size: 48))
+                .foregroundStyle(.tint)
+            VStack(spacing: 6) {
+                Text("Welcome to Xstream")
+                    .font(.title2).bold()
+                Text("Add an Xtream Codes portal or open an M3U playlist to start watching.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 340)
+            }
+            HStack(spacing: 12) {
+                Button {
+                    editing = Source(name: "", kind: .xtream(Server()))
+                } label: {
+                    Label("Add Xtream Server…", systemImage: "antenna.radiowaves.left.and.right")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Button {
+                    importing = true
+                } label: {
+                    Label("Open M3U Playlist…", systemImage: "doc.text")
+                }
+                .controlSize(.large)
+            }
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var fullscreenChannelDrawer: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Channels")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { showFullscreenDrawer = false }
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+            .padding(.bottom, 8)
+
+            HStack(spacing: 6) {
+                quickFilterPill("All", target: ChannelIndex.allGroup)
+                quickFilterPill("Favorites", icon: "star.fill", count: favoriteChannels.count, target: ChannelIndex.favoritesGroup)
+                quickFilterPill("Recent", icon: "clock", count: recentChannels.count, target: ChannelIndex.recentsGroup)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+
+            TextField("Filter channels…", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(shown) { c in
+                        let isCurrent = player.activeChannel?.id == c.id
+                        Button {
+                            playInBuiltIn(c)
+                            player.flashOSD(c.name)
+                        } label: {
+                            HStack(spacing: 10) {
+                                LogoImage(url: c.logo, width: 30, height: 22)
+                                    .padding(3)
+                                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(c.name)
+                                        .font(.callout)
+                                        .fontWeight(isCurrent ? .semibold : .regular)
+                                        .foregroundStyle(.white)
+                                        .lineLimit(1)
+                                    if let now = guide.now(c) {
+                                        Text(now.title)
+                                            .font(.caption2)
+                                            .foregroundStyle(.white.opacity(0.6))
+                                            .lineLimit(1)
+                                    }
+                                }
+                                Spacer(minLength: 4)
+                                if isCurrent {
+                                    Image(systemName: "speaker.wave.2.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                isCurrent ? Color.accentColor.opacity(0.25) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            )
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(8)
+            }
+        }
+        .frame(width: 310)
+        .frame(maxHeight: .infinity)
+        .background(.ultraThinMaterial)
+        .environment(\.colorScheme, .dark)
+        .overlay(alignment: .trailing) {
+            Rectangle().fill(.white.opacity(0.12)).frame(width: 1)
         }
     }
 
@@ -748,6 +970,50 @@ struct ContentView: View {
         miniWindow.close()
     }
 
+    private func zapChannel(offset: Int) {
+        guard !shown.isEmpty else { return }
+        let currentID = player.activeChannel?.id ?? playing?.id
+        let next: Channel
+        if let currentID, let idx = shown.firstIndex(where: { $0.id == currentID }) {
+            let target = (idx + offset + shown.count) % shown.count
+            next = shown[target]
+        } else {
+            next = shown[0]
+        }
+        playInBuiltIn(next)
+        player.flashOSD(next.name)
+    }
+
+    private func wireMenuBridge() {
+        bridge.onTogglePlayPause = { player.togglePlayPause() }
+        bridge.onStop = {
+            if theaterMode { toggleFullScreen() }
+            closeMiniPlayer()
+            player.stop()
+        }
+        bridge.onToggleMute = { player.toggleMute() }
+        bridge.onPreviousChannel = { zapChannel(offset: -1) }
+        bridge.onNextChannel = { zapChannel(offset: 1) }
+        bridge.onToggleFullScreen = { toggleFullScreen() }
+        bridge.onToggleMiniPlayer = { toggleMiniPlayer() }
+        bridge.onToggleDrawer = {
+            if theaterMode {
+                withAnimation(.easeInOut(duration: 0.2)) { showFullscreenDrawer.toggle() }
+            }
+        }
+        bridge.onRefresh = { refreshGeneration += 1 }
+    }
+
+    private func syncMenuBridge() {
+        bridge.hasActivePlayer = player.isActive
+        bridge.isPaused = player.isPaused
+        bridge.isMuted = player.isMuted
+        bridge.isTheaterMode = theaterMode
+        bridge.isMiniPlayer = miniPlayer
+        bridge.canZap = player.isActive && shown.count > 1
+        bridge.canRefresh = currentSource != nil && !loading
+    }
+
     @ViewBuilder
     private func miniPlayerContent(for channel: Channel) -> some View {
         EmbeddedPlayerView(
@@ -757,7 +1023,9 @@ struct ContentView: View {
             isMiniPlayer: true,
             onOpenInVLC: { playInVLC(channel) },
             onToggleFullScreen: toggleFullScreen,
-            onToggleMiniPlayer: toggleMiniPlayer
+            onToggleMiniPlayer: toggleMiniPlayer,
+            onPreviousChannel: shown.count > 1 ? { zapChannel(offset: -1) } : nil,
+            onNextChannel: shown.count > 1 ? { zapChannel(offset: 1) } : nil
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -1064,6 +1332,10 @@ struct ChannelRow: View {
     let server: Server?
     let isFavorite: Bool
     var isPlaying = false
+    var onPlay: (() -> Void)? = nil
+    var onToggleFavorite: (() -> Void)? = nil
+
+    @State private var hovered = false
 
     var body: some View {
         let now = guide.now(channel)
@@ -1092,14 +1364,36 @@ struct ChannelRow: View {
                 }
             }
             Spacer(minLength: 4)
-            if isPlaying {
-                Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint).font(.caption)
-            }
-            if isFavorite {
-                Image(systemName: "star.fill").foregroundStyle(.yellow).font(.caption)
+            if hovered {
+                if let onPlay {
+                    Button(action: onPlay) {
+                        Image(systemName: "play.fill").font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Play")
+                }
+                if let onToggleFavorite {
+                    Button(action: onToggleFavorite) {
+                        Image(systemName: isFavorite ? "star.fill" : "star")
+                            .font(.caption)
+                            .foregroundStyle(isFavorite ? .yellow : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(isFavorite ? "Remove from Favorites" : "Add to Favorites")
+                }
+            } else {
+                if isPlaying {
+                    Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint).font(.caption)
+                }
+                if isFavorite {
+                    Image(systemName: "star.fill").foregroundStyle(.yellow).font(.caption)
+                }
             }
         }
         .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onHover { hovered = $0 }
         .task(id: "\(channel.id)|\(guide.needsRefresh(channel))") {
             guard let server, guide.needsRefresh(channel) else { return }
             await guide.load(channel, from: server, debounce: .milliseconds(400))

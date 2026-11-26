@@ -25,6 +25,38 @@ struct MediaTrack: Identifiable, Hashable {
     let selected: Bool
 }
 
+enum DeinterlaceMode: String, CaseIterable, Identifiable {
+    case auto = "auto"
+    case on = "yes"
+    case off = "no"
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .auto: return "Auto"
+        case .on: return "On"
+        case .off: return "Off"
+        }
+    }
+}
+
+enum AspectMode: String, CaseIterable, Identifiable {
+    case auto
+    case widescreen
+    case standard
+    case fill
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .auto: return "Auto"
+        case .widescreen: return "16:9"
+        case .standard: return "4:3"
+        case .fill: return "Fill"
+        }
+    }
+}
+
 // MARK: - OpenGL Video View (vo=libmpv)
 
 /// Renders libmpv frames via mpv_render_context into an NSOpenGLView.
@@ -251,6 +283,36 @@ final class PlayerController {
     private(set) var subtitleTracks: [MediaTrack] = []
     private(set) var errorMessage: String?
     private(set) var reconnectAttempt = 0
+    private(set) var osdMessage: String?
+    private(set) var videoWidth: Int64 = 0
+    private(set) var videoHeightValue: Int64 = 0
+    private(set) var videoFPS: Double = 0
+    private(set) var droppedFrames: Int64 = 0
+    private(set) var audioCodec: String?
+    private(set) var audioChannels: Int64 = 0
+
+    var showStats = false
+
+    var deinterlace: DeinterlaceMode = .auto {
+        didSet {
+            setString("deinterlace", deinterlace.rawValue)
+            flashOSD("Deinterlace: \(deinterlace.label)")
+        }
+    }
+
+    var aspectMode: AspectMode = .auto {
+        didSet {
+            applyAspectMode()
+            flashOSD("Aspect: \(aspectMode.label)")
+        }
+    }
+
+    var playbackSpeed: Double = 1.0 {
+        didSet {
+            setDouble("speed", playbackSpeed)
+            flashOSD(String(format: "Speed: %.2g×", playbackSpeed))
+        }
+    }
 
     static var maxReconnectAttempts: Int { reconnectDelays.count }
 
@@ -283,6 +345,7 @@ final class PlayerController {
     @ObservationIgnored private var lastErrorLog: String?
     @ObservationIgnored private var sleepActivity: NSObjectProtocol?
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
+    @ObservationIgnored private var osdTask: Task<Void, Never>?
 
     init() {
         let savedVol = UserDefaults.standard.object(forKey: Self.volumeKey) as? Double ?? 80
@@ -317,8 +380,17 @@ final class PlayerController {
         position = 0
         duration = 0
         videoInfo = nil
+        videoWidth = 0
         videoHeight = 0
+        videoHeightValue = 0
+        videoFPS = 0
+        droppedFrames = 0
         videoCodec = nil
+        audioCodec = nil
+        audioChannels = 0
+        if channel.streamID != nil && playbackSpeed != 1.0 {
+            playbackSpeed = 1.0
+        }
         audioTracks = []
         subtitleTracks = []
         errorMessage = nil
@@ -363,8 +435,14 @@ final class PlayerController {
         position = 0
         duration = 0
         videoInfo = nil
+        videoWidth = 0
         videoHeight = 0
+        videoHeightValue = 0
+        videoFPS = 0
+        droppedFrames = 0
         videoCodec = nil
+        audioCodec = nil
+        audioChannels = 0
         audioTracks = []
         subtitleTracks = []
         errorMessage = nil
@@ -387,14 +465,50 @@ final class PlayerController {
 
     func toggleMute() {
         isMuted.toggle()
+        flashOSD(isMuted ? "Muted" : "Volume \(Int(volume))%")
     }
 
     func selectAudio(id: Int) {
         setString("aid", String(id))
+        if let t = audioTracks.first(where: { $0.id == id }) {
+            flashOSD("Audio: \(t.title)")
+        }
     }
 
     func selectSubtitle(id: Int?) {
         setString("sid", id.map(String.init) ?? "no")
+        if let id, let t = subtitleTracks.first(where: { $0.id == id }) {
+            flashOSD("Subtitles: \(t.title)")
+        } else {
+            flashOSD("Subtitles: Off")
+        }
+    }
+
+    func flashOSD(_ message: String) {
+        osdMessage = message
+        osdTask?.cancel()
+        osdTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard let self, !Task.isCancelled else { return }
+            self.osdMessage = nil
+        }
+    }
+
+    private func applyAspectMode() {
+        switch aspectMode {
+        case .auto:
+            setString("video-aspect-override", "-1")
+            setDouble("panscan", 0)
+        case .widescreen:
+            setString("video-aspect-override", "16:9")
+            setDouble("panscan", 0)
+        case .standard:
+            setString("video-aspect-override", "4:3")
+            setDouble("panscan", 0)
+        case .fill:
+            setString("video-aspect-override", "-1")
+            setDouble("panscan", 1)
+        }
     }
 
     func shutdown() {
@@ -503,6 +617,7 @@ final class PlayerController {
         mpv_set_option_string(handle, "input-media-keys", "no")
         mpv_set_option_string(handle, "volume", String(Int(volume)))
         mpv_set_option_string(handle, "mute", isMuted ? "yes" : "no")
+        mpv_set_option_string(handle, "deinterlace", deinterlace.rawValue)
 
         let status = mpv_initialize(handle)
         guard status >= 0 else {
@@ -525,8 +640,13 @@ final class PlayerController {
         mpv_observe_property(handle, 0, "seekable", MPV_FORMAT_FLAG)
         mpv_observe_property(handle, 0, "duration", MPV_FORMAT_DOUBLE)
         mpv_observe_property(handle, 0, "time-pos", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(handle, 0, "video-params/w", MPV_FORMAT_INT64)
         mpv_observe_property(handle, 0, "video-params/h", MPV_FORMAT_INT64)
         mpv_observe_property(handle, 0, "video-codec", MPV_FORMAT_STRING)
+        mpv_observe_property(handle, 0, "container-fps", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(handle, 0, "frame-drop-count", MPV_FORMAT_INT64)
+        mpv_observe_property(handle, 0, "audio-codec-name", MPV_FORMAT_STRING)
+        mpv_observe_property(handle, 0, "audio-params/channel-count", MPV_FORMAT_INT64)
         mpv_observe_property(handle, 0, "track-list/count", MPV_FORMAT_INT64)
         mpv_observe_property(handle, 0, "aid", MPV_FORMAT_STRING)
         mpv_observe_property(handle, 0, "sid", MPV_FORMAT_STRING)
@@ -724,14 +844,43 @@ final class PlayerController {
                 }
             }
 
+        case "video-params/w":
+            guard prop.format == MPV_FORMAT_INT64, let ptr = prop.data else { return }
+            let w = ptr.assumingMemoryBound(to: Int64.self).pointee
+            Task { @MainActor [weak self] in self?.videoWidth = w }
+
         case "video-params/h":
             guard prop.format == MPV_FORMAT_INT64, let ptr = prop.data else { return }
             let h = ptr.assumingMemoryBound(to: Int64.self).pointee
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.videoHeight = h
+                self.videoHeightValue = h
                 self.updateVideoInfo()
             }
+
+        case "container-fps":
+            guard prop.format == MPV_FORMAT_DOUBLE, let ptr = prop.data else { return }
+            let fps = ptr.assumingMemoryBound(to: Double.self).pointee
+            if fps.isFinite && fps > 0 {
+                Task { @MainActor [weak self] in self?.videoFPS = fps }
+            }
+
+        case "frame-drop-count":
+            guard prop.format == MPV_FORMAT_INT64, let ptr = prop.data else { return }
+            let drops = ptr.assumingMemoryBound(to: Int64.self).pointee
+            Task { @MainActor [weak self] in self?.droppedFrames = drops }
+
+        case "audio-codec-name":
+            guard prop.format == MPV_FORMAT_STRING, let ptr = prop.data,
+                  let cstr = ptr.assumingMemoryBound(to: UnsafePointer<CChar>?.self).pointee else { return }
+            let raw = String(cString: cstr).uppercased()
+            Task { @MainActor [weak self] in self?.audioCodec = raw }
+
+        case "audio-params/channel-count":
+            guard prop.format == MPV_FORMAT_INT64, let ptr = prop.data else { return }
+            let ch = ptr.assumingMemoryBound(to: Int64.self).pointee
+            Task { @MainActor [weak self] in self?.audioChannels = ch }
 
         case "video-codec":
             guard prop.format == MPV_FORMAT_STRING, let ptr = prop.data,
@@ -890,14 +1039,18 @@ struct EmbeddedPlayerView: View {
     let onOpenInVLC: () -> Void
     let onToggleFullScreen: () -> Void
     let onToggleMiniPlayer: () -> Void
+    var onPreviousChannel: (() -> Void)? = nil
+    var onNextChannel: (() -> Void)? = nil
+    var onToggleDrawer: (() -> Void)? = nil
 
     @State private var showControls = true
+    @State private var showSettings = false
     @State private var hideTask: Task<Void, Never>?
     @State private var isScrubbing = false
     @State private var scrubPosition: Double = 0
 
     private var controlsVisible: Bool {
-        showControls || !controller.isPlaying || controller.isLoading || controller.isBuffering || controller.errorMessage != nil
+        showControls || showSettings || !controller.isPlaying || controller.isLoading || controller.isBuffering || controller.errorMessage != nil
     }
 
     var body: some View {
@@ -938,6 +1091,38 @@ struct EmbeddedPlayerView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
                 .background(.black.opacity(0.65), in: Capsule())
+            }
+
+            // Stream stats overlay (optional, toggled from Video Settings)
+            if controller.showStats && !isMiniPlayer {
+                VStack {
+                    HStack {
+                        statsOverlay
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(.top, controlsVisible ? 52 : 14)
+                .padding(.leading, 14)
+                .allowsHitTesting(false)
+            }
+
+            // Transient OSD feedback toast (volume, mute, track change, zap)
+            if let osd = controller.osdMessage {
+                VStack {
+                    Spacer().frame(height: 54)
+                    Text(osd)
+                        .font(.callout).fontWeight(.medium)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .environment(\.colorScheme, .dark)
+                        .overlay(Capsule().strokeBorder(.white.opacity(0.15), lineWidth: 1))
+                    Spacer()
+                }
+                .allowsHitTesting(false)
+                .transition(.opacity)
             }
 
             // Auto-hiding HUD
@@ -981,11 +1166,46 @@ struct EmbeddedPlayerView: View {
         return controller.isLoading ? "Connecting…" : "Buffering…"
     }
 
+    private var statsOverlay: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            if controller.videoWidth > 0 && controller.videoHeightValue > 0 {
+                let fpsStr = controller.videoFPS > 0 ? String(format: " @ %.1f fps", controller.videoFPS) : ""
+                Text("Video: \(controller.videoWidth)×\(controller.videoHeightValue)\(fpsStr)")
+            }
+            if let info = controller.videoInfo {
+                Text("Codec: \(info)")
+            }
+            if let ac = controller.audioCodec {
+                let chStr = controller.audioChannels > 0 ? " (\(controller.audioChannels)ch)" : ""
+                Text("Audio: \(ac)\(chStr)")
+            }
+            Text("Dropped frames: \(controller.droppedFrames)")
+        }
+        .font(.caption2).monospaced()
+        .foregroundStyle(.white.opacity(0.92))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+
     private var topBar: some View {
         HStack(spacing: 10) {
             if isMiniPlayer {
                 // Leave room for the traffic-light close button in the floating panel.
                 Spacer().frame(width: 18)
+            } else if theaterMode, let onToggleDrawer {
+                Button(action: onToggleDrawer) {
+                    Image(systemName: "sidebar.left")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .padding(6)
+                .background(.black.opacity(0.45), in: Circle())
+                .help("Channel Drawer (⌘L)")
             }
             Text(channel.name)
                 .font(isMiniPlayer ? .subheadline : .headline)
@@ -1048,7 +1268,6 @@ struct EmbeddedPlayerView: View {
                 .foregroundStyle(.white)
                 .padding(6)
                 .background(.black.opacity(0.45), in: Circle())
-                .keyboardShortcut("f", modifiers: [.command, .shift])
                 .help(theaterMode ? "Exit Fullscreen (⇧⌘F or Esc)" : "Fullscreen (⇧⌘F or double-click video)")
             }
         }
@@ -1083,6 +1302,15 @@ struct EmbeddedPlayerView: View {
             }
 
             HStack(spacing: 12) {
+                if let onPreviousChannel {
+                    Button(action: onPreviousChannel) {
+                        Image(systemName: "backward.end.fill").font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .help("Previous channel (⌘[)")
+                }
+
                 Button {
                     controller.togglePlayPause()
                 } label: {
@@ -1092,8 +1320,16 @@ struct EmbeddedPlayerView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.white)
-                .keyboardShortcut("p", modifiers: .command)
                 .help(controller.isPaused ? "Play (⌘P)" : "Pause (⌘P)")
+
+                if let onNextChannel {
+                    Button(action: onNextChannel) {
+                        Image(systemName: "forward.end.fill").font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .help("Next channel (⌘])")
+                }
 
                 if controller.isSeekable {
                     Button { controller.seek(by: -10) } label: {
@@ -1191,6 +1427,20 @@ struct EmbeddedPlayerView: View {
                     .help("Subtitles")
                 }
 
+                if !isMiniPlayer {
+                    Button {
+                        showSettings.toggle()
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Video settings & stats")
+                    .popover(isPresented: $showSettings, arrowEdge: .top) {
+                        videoSettingsPopover
+                    }
+                }
+
                 Button {
                     if theaterMode { onToggleFullScreen() }
                     controller.stop()
@@ -1199,7 +1449,6 @@ struct EmbeddedPlayerView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.white.opacity(0.85))
-                .keyboardShortcut(".", modifiers: .command)
                 .help("Stop playback (⌘.)")
             }
         }
@@ -1214,6 +1463,65 @@ struct EmbeddedPlayerView: View {
         .shadow(color: .black.opacity(0.45), radius: 12, y: 4)
         .padding(.horizontal, isMiniPlayer ? 8 : 14)
         .padding(.bottom, isMiniPlayer ? 8 : 12)
+    }
+
+    private var videoSettingsPopover: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Deinterlace").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Picker("", selection: Binding(
+                    get: { controller.deinterlace },
+                    set: { controller.deinterlace = $0 }
+                )) {
+                    ForEach(DeinterlaceMode.allCases) { Text($0.label).tag($0) }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 140)
+            }
+
+            HStack {
+                Text("Aspect").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Picker("", selection: Binding(
+                    get: { controller.aspectMode },
+                    set: { controller.aspectMode = $0 }
+                )) {
+                    ForEach(AspectMode.allCases) { Text($0.label).tag($0) }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 165)
+            }
+
+            if controller.isSeekable {
+                HStack {
+                    Text("Speed").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { controller.playbackSpeed },
+                        set: { controller.playbackSpeed = $0 }
+                    )) {
+                        ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { s in
+                            Text(String(format: "%.2g×", s)).tag(s)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 90)
+                }
+            }
+
+            Divider()
+
+            Toggle("Show Stream Stats", isOn: Binding(
+                get: { controller.showStats },
+                set: { controller.showStats = $0 }
+            ))
+            .font(.caption)
+        }
+        .padding(12)
+        .frame(width: 260)
     }
 
     private var volumeIcon: String {
