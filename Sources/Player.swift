@@ -1200,11 +1200,12 @@ struct EmbeddedPlayerView: View {
             } else if theaterMode, let onToggleDrawer {
                 Button(action: onToggleDrawer) {
                     Image(systemName: "sidebar.left")
+                        .foregroundStyle(.white)
+                        .frame(width: 28, height: 28)
+                        .background(.black.opacity(0.5), in: Circle())
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .padding(6)
-                .background(.black.opacity(0.45), in: Circle())
                 .help("Channel Drawer (⌘L)")
             }
             Text(channel.name)
@@ -1251,11 +1252,12 @@ struct EmbeddedPlayerView: View {
                 onToggleMiniPlayer()
             } label: {
                 Image(systemName: isMiniPlayer ? "pip.exit" : "pip.enter")
+                    .foregroundStyle(.white)
+                    .frame(width: 28, height: 28)
+                    .background(.black.opacity(0.5), in: Circle())
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.white)
-            .padding(6)
-            .background(.black.opacity(0.45), in: Circle())
             .help(isMiniPlayer ? "Return to main window" : "Floating Mini-Player")
 
             if !isMiniPlayer {
@@ -1263,16 +1265,18 @@ struct EmbeddedPlayerView: View {
                     onToggleFullScreen()
                 } label: {
                     Image(systemName: theaterMode ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                        .foregroundStyle(.white)
+                        .frame(width: 28, height: 28)
+                        .background(.black.opacity(0.5), in: Circle())
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .padding(6)
-                .background(.black.opacity(0.45), in: Circle())
                 .help(theaterMode ? "Exit Fullscreen (⇧⌘F or Esc)" : "Fullscreen (⇧⌘F or double-click video)")
             }
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.top, theaterMode ? 24 : 10)
+        .padding(.bottom, 10)
         .background(
             LinearGradient(colors: [.black.opacity(0.72), .clear], startPoint: .top, endPoint: .bottom)
         )
@@ -1302,6 +1306,17 @@ struct EmbeddedPlayerView: View {
             }
 
             HStack(spacing: 12) {
+                if theaterMode, let onToggleDrawer {
+                    Button(action: onToggleDrawer) {
+                        Image(systemName: "list.bullet")
+                            .foregroundStyle(.white)
+                            .frame(width: 24, height: 24)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Channel Drawer (⌘L)")
+                }
+
                 if let onPreviousChannel {
                     Button(action: onPreviousChannel) {
                         Image(systemName: "backward.end.fill").font(.caption)
