@@ -12,7 +12,7 @@ struct Channel: Identifiable, Hashable, Sendable {
     var streamID: String? = nil
 }
 
-struct Programme: Identifiable, Hashable {
+struct Programme: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
     let summary: String
@@ -20,6 +20,32 @@ struct Programme: Identifiable, Hashable {
     let stop: Date
 
     var isNow: Bool { let t = Date(); return t >= start && t < stop }
+}
+
+/// Subscription and connection status returned by Xtream's `player_api.php` (no action).
+struct AccountInfo: Equatable, Sendable {
+    let status: String
+    let expiresAt: Date?
+    let activeConnections: Int?
+    let maxConnections: Int?
+    let isTrial: Bool
+    let allowedFormats: [String]
+    let timezone: String?
+
+    var isActive: Bool { status.caseInsensitiveCompare("Active") == .orderedSame }
+
+    func daysRemaining(from now: Date = Date()) -> Int? {
+        guard let expiresAt else { return nil }
+        return Int(floor(expiresAt.timeIntervalSince(now) / 86_400))
+    }
+
+    var connectionsSummary: String? {
+        switch (activeConnections, maxConnections) {
+        case let (a?, m?): return "\(a) / \(m)"
+        case let (nil, m?): return "max \(m)"
+        default: return nil
+        }
+    }
 }
 
 struct Server: Codable, Hashable {
@@ -148,10 +174,32 @@ struct ChannelIndex: Equatable, Sendable {
 }
 
 /// Xtream panels base64-encode EPG text, but not all of them do it consistently —
-/// fall back to the raw string when it isn't valid base64.
+/// only decode strict base64 whose UTF-8 output contains printable text, otherwise pass
+/// through raw so plain-text titles never get garbled.
 func decodeEPGText(_ raw: String) -> String {
-    guard let d = Data(base64Encoded: raw, options: .ignoreUnknownCharacters),
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, trimmed.count % 4 == 0 else { return raw }
+    // Strict base64 check: only valid base64 chars, '=' padding only at the end (max 2).
+    var seenPad = 0
+    for u in trimmed.unicodeScalars {
+        let v = u.value
+        let isAlphaNum = (v >= 65 && v <= 90) || (v >= 97 && v <= 122) || (v >= 48 && v <= 57)
+        if isAlphaNum || v == 43 || v == 47 {
+            if seenPad > 0 { return raw }
+        } else if v == 61 {
+            seenPad += 1
+            if seenPad > 2 { return raw }
+        } else {
+            return raw
+        }
+    }
+    guard let d = Data(base64Encoded: trimmed),
           let s = String(data: d, encoding: .utf8), !s.isEmpty else { return raw }
+    // Reject ASCII control characters (except tab/LF/CR) that indicate coincidental decode.
+    for u in s.unicodeScalars {
+        let v = u.value
+        if (v < 0x20 && v != 0x09 && v != 0x0A && v != 0x0D) || v == 0x7F { return raw }
+    }
     return s
 }
 
@@ -279,9 +327,47 @@ enum Xtream {
         return out
     }
 
+    /// Parses `user_info` + `server_info` from `player_api.php` (no action).
+    static func parseAccountInfo(_ data: Data) -> AccountInfo? {
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let user = root["user_info"] as? [String: Any] else { return nil }
+        let server = root["server_info"] as? [String: Any] ?? [:]
+
+        let status = string(user, "status") ?? "Unknown"
+        let expSecs = string(user, "exp_date").flatMap(Double.init)
+        let expiresAt: Date? = (expSecs != nil && expSecs! > 0) ? Date(timeIntervalSince1970: expSecs!) : nil
+        let activeCons = string(user, "active_cons").flatMap(Int.init)
+        let maxCons = string(user, "max_connections").flatMap(Int.init)
+        let trialStr = string(user, "is_trial")?.lowercased() ?? "0"
+        let isTrial = trialStr == "1" || trialStr == "true"
+        let formats = (user["allowed_output_formats"] as? [String]) ?? []
+        let timezone = string(server, "timezone")
+
+        return AccountInfo(
+            status: status,
+            expiresAt: expiresAt,
+            activeConnections: activeCons,
+            maxConnections: maxCons,
+            isTrial: isTrial,
+            allowedFormats: formats,
+            timezone: timezone
+        )
+    }
+
+    static func accountInfo(_ s: Server) async throws -> AccountInfo {
+        let str = "\(base(s))/player_api.php?username=\(esc(s.username))&password=\(esc(s.password))"
+        guard let u = URL(string: str) else { throw Err("Bad server address") }
+        let (d, r) = try await URLSession.shared.data(from: u)
+        if let h = r as? HTTPURLResponse, h.statusCode != 200 { throw Err("HTTP \(h.statusCode)") }
+        guard let info = parseAccountInfo(d) else {
+            throw Err("Could not read account info — wrong credentials or not an Xtream server?")
+        }
+        return info
+    }
+
     /// Now/next for one live channel. get_short_epg is a single small request per channel;
     /// the alternative (xmltv.php) is a multi-megabyte dump of the entire portal.
-    static func epg(_ s: Server, streamID: String, limit: Int = 8) async throws -> [Programme] {
+    static func epg(_ s: Server, streamID: String, limit: Int = 12) async throws -> [Programme] {
         let listings = try await rows(s, "get_short_epg", "&stream_id=\(streamID)&limit=\(limit)")
         return listings.compactMap { r in
             guard let startSecs = string(r, "start_timestamp").flatMap(Double.init),
@@ -432,39 +518,92 @@ enum VLC {
 @MainActor
 @Observable
 final class Guide {
-    private(set) var listings: [String: [Programme]] = [:]
+    private struct Entry {
+        let programmes: [Programme]
+        let fetchedAt: Date
+    }
+
+    /// Empty EPG responses are cached briefly so channels with no guide don't re-request
+    /// on every scroll, while still retrying later.
+    private static let emptyTTL: TimeInterval = 15 * 60
+    private static let maxConcurrent = 5
+
+    private var entries: [String: Entry] = [:]
     /// Observed by every row, so bumping it re-evaluates which programme is current.
     private(set) var clock = Date()
     private var inflight: Set<String> = []
+    private var activeRequests = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
 
     init() {
         // Lives as long as the app does, so there is nothing to cancel.
         Task { while true { try? await Task.sleep(for: .seconds(60)); clock = Date() } }
     }
 
-    func programmes(_ channel: Channel) -> [Programme] { listings[channel.id] ?? [] }
+    func programmes(_ channel: Channel) -> [Programme] { entries[channel.id]?.programmes ?? [] }
 
     func now(_ channel: Channel) -> Programme? {
         programmes(channel).first { clock >= $0.start && clock < $0.stop }
     }
 
+    func needsRefresh(_ channel: Channel) -> Bool {
+        guard channel.streamID != nil else { return false }
+        guard let entry = entries[channel.id] else { return true }
+        if let lastStop = entry.programmes.last?.stop {
+            return lastStop <= clock
+        }
+        return clock.timeIntervalSince(entry.fetchedAt) >= Self.emptyTTL
+    }
+
+    func invalidate(_ channel: Channel) {
+        entries.removeValue(forKey: channel.id)
+    }
+
     func clear() {
-        listings = [:]
+        entries = [:]
         inflight = []
     }
 
+    private func acquireSlot() async {
+        if activeRequests < Self.maxConcurrent {
+            activeRequests += 1
+            return
+        }
+        await withCheckedContinuation { cont in
+            waiters.append(cont)
+        }
+    }
+
+    private func releaseSlot() {
+        if !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            next.resume()
+        } else {
+            activeRequests = max(0, activeRequests - 1)
+        }
+    }
+
     /// `debounce` lets rows that scroll straight past cancel before spending a request.
-    func load(_ channel: Channel, from server: Server, debounce: Duration = .zero) async {
-        guard let streamID = channel.streamID, listings[channel.id] == nil,
-              !inflight.contains(channel.id) else { return }
+    /// `force` bypasses the cache for manual refreshes.
+    func load(_ channel: Channel, from server: Server, debounce: Duration = .zero, force: Bool = false) async {
+        guard let streamID = channel.streamID, !inflight.contains(channel.id) else { return }
+        if !force && !needsRefresh(channel) { return }
         if debounce > .zero {
             try? await Task.sleep(for: debounce)
             if Task.isCancelled { return }
         }
+        guard !inflight.contains(channel.id) else { return }
+        if !force && !needsRefresh(channel) { return }
+
         inflight.insert(channel.id)
         defer { inflight.remove(channel.id) }
+
+        await acquireSlot()
+        defer { releaseSlot() }
+        if Task.isCancelled { return }
+
         if let programmes = try? await Xtream.epg(server, streamID: streamID) {
-            listings[channel.id] = programmes
+            entries[channel.id] = Entry(programmes: programmes, fetchedAt: Date())
         }
     }
 }

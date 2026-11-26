@@ -53,6 +53,9 @@ struct ContentView: View {
     @State private var exportName = "channels"
     @State private var favorites = Favorites.load()
     @State private var guide = Guide()
+    @State private var accountInfo: AccountInfo?
+    @State private var loadingAccount = false
+    @State private var refreshGeneration = 0
 
     private var currentSource: Source? { sources.first(where: { $0.id == selected }) }
 
@@ -65,11 +68,13 @@ struct ContentView: View {
         let kind: SourceKind?
         let live: Bool
         let movies: Bool
+        let refresh: Int
     }
 
     private var loadKey: LoadKey {
         LoadKey(id: selected, kind: currentSource?.kind,
-                live: currentFilter.live, movies: currentFilter.movies)
+                live: currentFilter.live, movies: currentFilter.movies,
+                refresh: refreshGeneration)
     }
 
     /// Drives cached `shown` updates so body renders (selection, play errors, sheets) never
@@ -135,30 +140,39 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             NavigationSplitView {
-                List(selection: $selected) {
-                ForEach(sources) { s in
-                    Label(s.name, systemImage: {
-                        if case .xtream = s.kind { return "antenna.radiowaves.left.and.right" } else { return "doc.text" }
-                    }()).tag(s.id)
+                VStack(spacing: 0) {
+                    List(selection: $selected) {
+                        ForEach(sources) { s in
+                            Label(s.name, systemImage: {
+                                if case .xtream = s.kind { return "antenna.radiowaves.left.and.right" } else { return "doc.text" }
+                            }()).tag(s.id)
+                        }
+                    }
+                    .contextMenu(forSelectionType: Source.ID.self) { ids in
+                        if ids.count == 1, let s = sources.first(where: { ids.contains($0.id) }) {
+                            Button("Edit…") { editing = s }
+                        }
+                        Button("Remove", role: .destructive) {
+                            if let selected, ids.contains(selected) { player.stop() }
+                            sources.removeAll { ids.contains($0.id) }
+                            Store.save(sources)
+                        }
+                    }
+                    if currentServer != nil {
+                        AccountFooterView(
+                            info: accountInfo,
+                            loading: loadingAccount,
+                            onRefresh: { Task { await loadAccountInfo() } }
+                        )
+                    }
                 }
-            }
-            .contextMenu(forSelectionType: Source.ID.self) { ids in
-                if ids.count == 1, let s = sources.first(where: { ids.contains($0.id) }) {
-                    Button("Edit…") { editing = s }
+                .navigationSplitViewColumnWidth(min: 180, ideal: 220)
+                .toolbar {
+                    Menu {
+                        Button("Xtream Server…") { editing = Source(name: "", kind: .xtream(Server())) }
+                        Button("M3U File…") { importing = true }
+                    } label: { Image(systemName: "plus") }
                 }
-                Button("Remove", role: .destructive) {
-                    if let selected, ids.contains(selected) { player.stop() }
-                    sources.removeAll { ids.contains($0.id) }
-                    Store.save(sources)
-                }
-            }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 220)
-            .toolbar {
-                Menu {
-                    Button("Xtream Server…") { editing = Source(name: "", kind: .xtream(Server())) }
-                    Button("M3U File…") { importing = true }
-                } label: { Image(systemName: "plus") }
-            }
         } content: {
             VStack(spacing: 0) {
                 if loading { ProgressView().padding() }
@@ -196,6 +210,12 @@ struct ContentView: View {
             .searchable(text: $query, placement: .toolbar, prompt: "Search channels")
             .navigationSplitViewColumnWidth(min: 240, ideal: 320)
             .toolbar {
+                Button { refreshGeneration += 1 } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(currentSource == nil || loading)
+                .keyboardShortcut("r", modifiers: .command)
+                .help("Reload channels, guide, and account info (⌘R)")
                 Menu {
                     Picker("Default Player", selection: $defaultPlayer) {
                         ForEach(PlaybackTarget.allCases) { target in
@@ -413,7 +433,14 @@ struct ContentView: View {
                 Text(playError).foregroundStyle(.red).textSelection(.enabled)
             }
 
-            GuideView(guide: guide, channel: c)
+            GuideView(
+                guide: guide,
+                channel: c,
+                onRefresh: currentServer != nil ? {
+                    guard let server = currentServer else { return }
+                    Task { await guide.load(c, from: server, force: true) }
+                } : nil
+            )
 
             HStack(spacing: 8) {
                 if defaultPlayer == .builtin {
@@ -481,11 +508,20 @@ struct ContentView: View {
         await guide.load(playing, from: server)      // no debounce: the user picked this one
     }
 
+    private func loadAccountInfo() async {
+        guard let server = currentServer else { accountInfo = nil; return }
+        loadingAccount = true
+        defer { loadingAccount = false }
+        if let info = try? await Xtream.accountInfo(server) {
+            if !Task.isCancelled { accountInfo = info }
+        }
+    }
+
     private func loadSelected() async {
         // Reset before the guard: removing the selected source must empty the list too.
         theaterMode = false; player.stop()
         error = nil; allChannels = []; index = .empty; favoriteNames = []; favoriteChannels = []
-        shown = []; group = ChannelIndex.allGroup; playing = nil; guide.clear(); searchGeneration += 1
+        shown = []; group = ChannelIndex.allGroup; playing = nil; guide.clear(); accountInfo = nil; searchGeneration += 1
         guard let source = currentSource else { return }
         let filter = source.filter ?? SourceFilter()
         loading = true
@@ -493,7 +529,10 @@ struct ContentView: View {
         do {
             switch source.kind {
             case .xtream(let s):
-                allChannels = try await Xtream.channels(s, live: filter.live, movies: filter.movies)
+                async let channelsTask = Xtream.channels(s, live: filter.live, movies: filter.movies)
+                async let accountTask: AccountInfo? = try? await Xtream.accountInfo(s)
+                allChannels = try await channelsTask
+                accountInfo = await accountTask
             case .m3u(let path):
                 allChannels = try await loadM3U(path: path)
             }
@@ -532,6 +571,7 @@ struct SourceEditor: View {
     @State private var loadingCategories = false
     @State private var categoryError: String?
     @State private var categoryQuery = ""
+    @State private var accountInfo: AccountInfo?
 
     init(source: Source, onSave: @escaping (Source) -> Void) {
         self.onSave = onSave
@@ -568,6 +608,13 @@ struct SourceEditor: View {
                     TextField("Server", text: $server.host, prompt: Text("http://host:port"))
                     TextField("Username", text: $server.username)
                     SecureField("Password", text: $server.password)
+                }
+            }
+
+            if isXtream, let info = accountInfo {
+                GroupBox("Subscription") {
+                    AccountDetailsGrid(info: info)
+                        .padding(4)
                 }
             }
 
@@ -675,7 +722,10 @@ struct SourceEditor: View {
             var found: [String]
             switch source.kind {
             case .xtream:
-                found = try await Xtream.categories(server)
+                async let catsTask = Xtream.categories(server)
+                async let infoTask: AccountInfo? = try? await Xtream.accountInfo(server)
+                found = try await catsTask
+                accountInfo = await infoTask
             case .m3u(let path):
                 found = try await loadM3U(path: path).map(\.group)
             }
@@ -736,17 +786,16 @@ struct ChannelRow: View {
                 Image(systemName: "star.fill").foregroundStyle(.yellow).font(.caption)
             }
         }
-        .task(id: channel.id) {
-            guard let server else { return }
+        .task(id: "\(channel.id)|\(guide.needsRefresh(channel))") {
+            guard let server, guide.needsRefresh(channel) else { return }
             await guide.load(channel, from: server, debounce: .milliseconds(400))
         }
         .help(now.map { "\($0.title)\n\($0.summary)" } ?? "")
     }
 }
 
-/// Now and next, from the channel's short EPG. Live TV needs the current programme's
-/// progress more than it needs a full grid, so that is all this shows. It reads the guide
-/// itself, like ChannelRow, so ContentView never observes `listings`.
+/// Now and next, from the channel's short EPG, with full description and expandable upcoming
+/// schedule. Reads the guide itself, like ChannelRow, so ContentView never observes entries.
 // ponytail: the app logs "reentrant operation in its NSTableView delegate" at startup.
 // Verified it is not ours — it still fires with the row EPG task and the deferred
 // selection writes removed, so it comes from SwiftUI's own List bookkeeping. Harmless
@@ -754,25 +803,48 @@ struct ChannelRow: View {
 struct GuideView: View {
     let guide: Guide
     let channel: Channel
+    var onRefresh: (() -> Void)? = nil
+
+    @State private var showAllUpcoming = false
 
     var body: some View {
-        // Re-renders every 30s so "now" and the progress bar don't go stale while watching.
-        TimelineView(.periodic(from: .now, by: 30)) { _ in
+        // Re-renders every 30s so "now", remaining time, and the progress bar stay fresh.
+        TimelineView(.periodic(from: .now, by: 30)) { context in
             let programmes = guide.programmes(channel)
-            if !programmes.isEmpty { content(programmes) }
+            if !programmes.isEmpty {
+                content(programmes, at: context.date)
+            }
         }
+        .onChange(of: channel.id) { showAllUpcoming = false }
     }
 
-    private func content(_ programmes: [Programme]) -> some View {
-        let now = programmes.first(where: \.isNow) ?? programmes.first
-        return VStack(alignment: .leading, spacing: 2) {
+    private func content(_ programmes: [Programme], at date: Date) -> some View {
+        let now = programmes.first { date >= $0.start && date < $0.stop } ?? programmes.first
+        let upcoming = programmes.filter { $0.start > (now?.start ?? .distantPast) }
+        let shownUpcoming = showAllUpcoming ? upcoming : Array(upcoming.prefix(2))
+
+        return VStack(alignment: .leading, spacing: 6) {
             if let now {
                 HStack(spacing: 6) {
                     Text(span(now)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
-                    Text(now.title).font(.caption).bold().lineLimit(1)
+                    Text(now.title).font(.callout).bold().lineLimit(2)
+                    Spacer()
+                    if date >= now.start && date < now.stop {
+                        let minsLeft = max(1, Int(ceil(now.stop.timeIntervalSince(date) / 60)))
+                        Text("\(minsLeft)m left")
+                            .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    if let onRefresh {
+                        Button(action: onRefresh) {
+                            Image(systemName: "arrow.clockwise").font(.caption2)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("Refresh guide for this channel")
+                    }
                 }
-                if now.isNow {
-                    ProgressView(value: Date().timeIntervalSince(now.start),
+                if date >= now.start && date < now.stop {
+                    ProgressView(value: min(max(date.timeIntervalSince(now.start), 0), max(now.stop.timeIntervalSince(now.start), 1)),
                                  total: max(now.stop.timeIntervalSince(now.start), 1))
                         .controlSize(.small)
                 }
@@ -780,23 +852,147 @@ struct GuideView: View {
                     Text(now.summary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .padding(.top, 2)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            ForEach(programmes.filter { $0.start > (now?.start ?? .distantPast) }.prefix(2)) { p in
-                HStack(spacing: 6) {
-                    Text(span(p)).font(.caption2).monospacedDigit()
-                    Text(p.title).font(.caption2).lineLimit(1)
+
+            if !shownUpcoming.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(shownUpcoming) { p in
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(span(p)).font(.caption2).monospacedDigit()
+                            Text(p.title).font(.caption2).lineLimit(1)
+                        }
+                        .foregroundStyle(.secondary)
+                        .help(p.summary)
+                    }
+                    if upcoming.count > 2 {
+                        Button(showAllUpcoming ? "Show less" : "More upcoming (\(upcoming.count - 2))") {
+                            showAllUpcoming.toggle()
+                        }
+                        .buttonStyle(.link)
+                        .font(.caption2)
+                    }
                 }
-                .foregroundStyle(.secondary)
+                .padding(.top, 2)
             }
         }
-        .help(now?.summary ?? "")
     }
 
     private func span(_ p: Programme) -> String {
         "\(p.start.formatted(date: .omitted, time: .shortened))–\(p.stop.formatted(date: .omitted, time: .shortened))"
+    }
+}
+
+/// Compact Xtream subscription summary pinned at the bottom of the Sources sidebar.
+struct AccountFooterView: View {
+    let info: AccountInfo?
+    let loading: Bool
+    let onRefresh: () -> Void
+
+    private var statusColor: Color {
+        guard let info else { return .secondary }
+        if !info.isActive { return .red }
+        if let days = info.daysRemaining(), days <= 7 { return days < 0 ? .red : .orange }
+        return .green
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Divider()
+            HStack(spacing: 6) {
+                Circle().fill(statusColor).frame(width: 7, height: 7)
+                if let info {
+                    Text(info.isTrial ? "\(info.status) · Trial" : info.status)
+                        .font(.caption).bold()
+                } else {
+                    Text(loading ? "Checking account…" : "Account")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if loading {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Button(action: onRefresh) {
+                        Image(systemName: "arrow.clockwise").font(.caption2)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Refresh subscription status")
+                }
+            }
+            if let info {
+                if let exp = info.expiresAt {
+                    let days = info.daysRemaining()
+                    let suffix: String = {
+                        guard let days else { return "" }
+                        if days < 0 { return " (expired)" }
+                        if days == 0 { return " (today)" }
+                        return " (\(days)d)"
+                    }()
+                    Text("Expires \(exp.formatted(date: .abbreviated, time: .omitted))\(suffix)")
+                        .font(.caption2)
+                        .foregroundStyle((days ?? 99) <= 7 ? statusColor : .secondary)
+                } else {
+                    Text("No expiry")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let cons = info.connectionsSummary {
+                    Text("Connections: \(cons)")
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+/// Detailed subscription block shown inside the Xtream Source Editor sheet.
+struct AccountDetailsGrid: View {
+    let info: AccountInfo
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
+            GridRow {
+                Text("Status").foregroundStyle(.secondary)
+                Text(info.isTrial ? "\(info.status) (Trial)" : info.status)
+                    .foregroundStyle(info.isActive ? Color.primary : Color.red)
+            }
+            GridRow {
+                Text("Expires").foregroundStyle(.secondary)
+                if let exp = info.expiresAt {
+                    let days = info.daysRemaining()
+                    Text("\(exp.formatted(date: .abbreviated, time: .shortened))" + (days.map { $0 >= 0 ? " (\($0)d left)" : " (expired)" } ?? ""))
+                } else {
+                    Text("Unlimited")
+                }
+            }
+            if let cons = info.connectionsSummary {
+                GridRow {
+                    Text("Connections").foregroundStyle(.secondary)
+                    Text(cons).monospacedDigit()
+                }
+            }
+            if !info.allowedFormats.isEmpty {
+                GridRow {
+                    Text("Formats").foregroundStyle(.secondary)
+                    Text(info.allowedFormats.joined(separator: ", "))
+                }
+            }
+            if let tz = info.timezone {
+                GridRow {
+                    Text("Server TZ").foregroundStyle(.secondary)
+                    Text(tz)
+                }
+            }
+        }
+        .font(.caption)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

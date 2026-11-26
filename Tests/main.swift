@@ -34,7 +34,38 @@ assert(Xtream.string(["stream_id": 42], "stream_id") == "42")
 assert(decodeEPGText("UHJlbWllciBMZWFndWU=") == "Premier League", decodeEPGText("UHJlbWllciBMZWFndWU="))
 assert(decodeEPGText("Premier League") == "Premier League")   // not base64 -> passed through
 assert(decodeEPGText("News") == "News", decodeEPGText("News")) // 4 chars: valid base64, invalid UTF-8
+assert(decodeEPGText("AAAA") == "AAAA", decodeEPGText("AAAA")) // control chars -> must not decode
+assert(decodeEPGText("Live TV!") == "Live TV!")                // punctuation -> strict base64 rejects
 assert(decodeEPGText("") == "")
+
+// Xtream account / subscription info parsing (strings, numbers, unlimited expiry, trial).
+let accountJSON = #"""
+{
+  "user_info": {
+    "status": "Active",
+    "exp_date": "1800000000",
+    "is_trial": "0",
+    "active_cons": 1,
+    "max_connections": "3",
+    "allowed_output_formats": ["m3u8", "ts"]
+  },
+  "server_info": {
+    "timezone": "Europe/London"
+  }
+}
+"""#
+let acc = Xtream.parseAccountInfo(Data(accountJSON.utf8))!
+assert(acc.isActive && !acc.isTrial)
+assert(acc.expiresAt == Date(timeIntervalSince1970: 1_800_000_000))
+assert(acc.connectionsSummary == "1 / 3")
+assert(acc.allowedFormats == ["m3u8", "ts"])
+assert(acc.timezone == "Europe/London")
+assert(acc.daysRemaining(from: Date(timeIntervalSince1970: 1_800_000_000 - 86_400 * 5)) == 5)
+
+let unlimitedJSON = #"{"user_info":{"status":"Active","exp_date":null,"is_trial":"1","max_connections":"2"}}"#
+let unlim = Xtream.parseAccountInfo(Data(unlimitedJSON.utf8))!
+assert(unlim.expiresAt == nil && unlim.isTrial && unlim.connectionsSummary == "max 2")
+assert(Xtream.parseAccountInfo(Data("{}".utf8)) == nil)
 
 // Export has to survive our own parser, or the file is no use to anyone else either.
 let roundTripped = parseM3U(exportM3U(cs), base: base)
