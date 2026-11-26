@@ -184,4 +184,14 @@ assert(bigIdx.byGroup["Group 49"]?.count == 600)
 assert(bigIdx.filter(group: ChannelIndex.allGroup, query: "kringvarp", favorites: []).map(\.id) == ["live-19999"])
 assert(bigIdx.filter(group: "Group 49", query: "føroya", favorites: []).map(\.id) == ["live-19999"])
 
+// Recents tracking & resolution (newest first, deduplicated).
+var recentStore: [String: [String]] = [:]
+let sid = UUID()
+Recents.record(sid, channelName: "BBC News", in: &recentStore)
+Recents.record(sid, channelName: "Sky Sports HD", in: &recentStore)
+Recents.record(sid, channelName: "BBC News", in: &recentStore)
+let resolvedRecents = Recents.resolve(sid, from: recentStore, in: idxChannels)
+assert(resolvedRecents.map(\.name) == ["BBC News", "Sky Sports HD"])
+assert(idx.base(group: ChannelIndex.recentsGroup, favorites: [], recents: resolvedRecents).map(\.id) == ["live-1", "live-2"])
+
 print("ok — \(cs.count) channels parsed, all checks passed")

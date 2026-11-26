@@ -36,6 +36,10 @@ struct ContentView: View {
     @State private var shown: [Channel] = []
     @State private var favoriteNames: Set<String> = []
     @State private var favoriteChannels: [Channel] = []
+    @State private var recentsStore = Recents.load()
+    @State private var recentChannels: [Channel] = []
+    @State private var copiedChannelID: Channel.ID?
+    @State private var copiedResetTask: Task<Void, Never>?
     @State private var searchGeneration = 0
     @State private var lastSearchedQuery = ""
     @State private var loading = false
@@ -127,6 +131,35 @@ struct ContentView: View {
         favoriteChannels = names.isEmpty ? [] : index.channels.filter { names.contains($0.name) }
     }
 
+    private func rebuildRecents() {
+        guard let selected else { recentChannels = []; return }
+        recentChannels = Recents.resolve(selected, from: recentsStore, in: index.channels)
+    }
+
+    private func recordRecent(_ c: Channel) {
+        guard let selected else { return }
+        Recents.record(selected, channelName: c.name, in: &recentsStore)
+        Recents.save(recentsStore)
+        rebuildRecents()
+        if group == ChannelIndex.recentsGroup {
+            if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                shown = recentChannels
+            }
+            searchGeneration += 1
+        }
+    }
+
+    private func copyURL(_ c: Channel) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(c.url.absoluteString, forType: .string)
+        copiedChannelID = c.id
+        copiedResetTask?.cancel()
+        copiedResetTask = Task {
+            try? await Task.sleep(for: .seconds(2))
+            if !Task.isCancelled && copiedChannelID == c.id { copiedChannelID = nil }
+        }
+    }
+
     private func toggleFavorite(_ c: Channel) {
         guard let selected else { return }
         let key = Favorites.key(selected, c)
@@ -146,10 +179,22 @@ struct ContentView: View {
             NavigationSplitView {
                 VStack(spacing: 0) {
                     List(selection: $selected) {
-                        ForEach(sources) { s in
-                            Label(s.name, systemImage: {
-                                if case .xtream = s.kind { return "antenna.radiowaves.left.and.right" } else { return "doc.text" }
-                            }()).tag(s.id)
+                        Section("Sources") {
+                            ForEach(sources) { s in
+                                HStack {
+                                    Label(s.name, systemImage: {
+                                        if case .xtream = s.kind { return "antenna.radiowaves.left.and.right" } else { return "doc.text" }
+                                    }())
+                                    Spacer()
+                                    if s.id == selected && !index.channels.isEmpty {
+                                        Text("\(index.channels.count)")
+                                            .font(.caption2)
+                                            .monospacedDigit()
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .tag(s.id)
+                            }
                         }
                     }
                     .contextMenu(forSelectionType: Source.ID.self) { ids in
@@ -183,12 +228,41 @@ struct ContentView: View {
                 }
         } content: {
             VStack(spacing: 0) {
-                if loading { ProgressView().padding() }
-                if let error { Text(error).foregroundStyle(.red).padding(.horizontal).textSelection(.enabled) }
-                Picker("", selection: $group) {
-                    ForEach(index.groups, id: \.self) { Text($0).tag($0) }
+                if loading && shown.isEmpty { ProgressView().padding() }
+                if let error { Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal, 10).padding(.vertical, 6).textSelection(.enabled) }
+                VStack(spacing: 6) {
+                    HStack(spacing: 6) {
+                        quickFilterPill("All", target: ChannelIndex.allGroup)
+                        quickFilterPill("Favorites", icon: "star.fill", count: favoriteChannels.count, target: ChannelIndex.favoritesGroup)
+                        quickFilterPill("Recent", icon: "clock", count: recentChannels.count, target: ChannelIndex.recentsGroup)
+                        Spacer(minLength: 0)
+                    }
+                    HStack(spacing: 6) {
+                        Picker("", selection: Binding(
+                            get: { index.categoryGroups.contains(group) ? group : ChannelIndex.allGroup },
+                            set: { group = $0 }
+                        )) {
+                            Text("All Categories").tag(ChannelIndex.allGroup)
+                            if !index.categoryGroups.isEmpty {
+                                Divider()
+                                ForEach(index.categoryGroups, id: \.self) { Text($0).tag($0) }
+                            }
+                        }
+                        .labelsHidden()
+                        .controlSize(.small)
+
+                        Text(query.trimmingCharacters(in: .whitespaces).isEmpty
+                             ? "\(shown.count)"
+                             : "\(shown.count) match\(shown.count == 1 ? "" : "es")")
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .fixedSize()
+                    }
                 }
-                .labelsHidden().padding(6)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 7)
+                Divider()
                 // Selecting only shows the channel; double-click or Return plays it. Playing on
                 // select sent every channel the arrow keys passed over to the player.
                 List(shown, selection: Binding(get: { playing?.id }, set: { id in
@@ -302,7 +376,7 @@ struct ContentView: View {
         .onChange(of: currentFilter) { applyFilter() }
         .onChange(of: group) {
             if query.trimmingCharacters(in: .whitespaces).isEmpty {
-                shown = index.base(group: group, favorites: favoriteChannels)
+                shown = index.base(group: group, favorites: favoriteChannels, recents: recentChannels)
             }
         }
         .task(id: searchKey) { await updateShown() }
@@ -336,19 +410,20 @@ struct ContentView: View {
         let filtered = currentFilter.apply(allChannels)
         index = ChannelIndex(channels: filtered, filter: currentFilter)
         rebuildFavorites()
-        if !index.groups.contains(group) { group = ChannelIndex.allGroup }
+        rebuildRecents()
+        if group != ChannelIndex.recentsGroup && !index.groups.contains(group) { group = ChannelIndex.allGroup }
         if let playing, index.byID[playing.id] != playing { self.playing = nil }
         if error == nil || error == Self.allHidden {
             error = !allChannels.isEmpty && index.channels.isEmpty ? Self.allHidden : nil
         }
         if query.trimmingCharacters(in: .whitespaces).isEmpty {
-            shown = index.base(group: group, favorites: favoriteChannels)
+            shown = index.base(group: group, favorites: favoriteChannels, recents: recentChannels)
         }
         searchGeneration += 1
     }
 
     private func updateShown() async {
-        let pool = index.base(group: group, favorites: favoriteChannels)
+        let pool = index.base(group: group, favorites: favoriteChannels, recents: recentChannels)
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty, !pool.isEmpty else {
             shown = pool
@@ -382,6 +457,37 @@ struct ContentView: View {
     private static let allHidden = "Every category is hidden. Use the filter button to show some."
 
     @ViewBuilder
+    private func quickFilterPill(_ label: String, icon: String? = nil, count: Int? = nil, target: String) -> some View {
+        let active = group == target
+        Button {
+            group = target
+        } label: {
+            HStack(spacing: 4) {
+                if let icon {
+                    Image(systemName: icon)
+                        .font(.caption2)
+                        .foregroundStyle(active ? .white : (target == ChannelIndex.favoritesGroup ? .yellow : .secondary))
+                }
+                Text(label).font(.caption).fontWeight(active ? .semibold : .regular)
+                if let count, count > 0 {
+                    Text("\(count)")
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .opacity(active ? 0.85 : 0.65)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                active ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.quaternary.opacity(0.6)),
+                in: Capsule()
+            )
+            .foregroundStyle(active ? .white : .primary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
     private var detailPane: some View {
         let inspected = playing ?? player.activeChannel
         if let active = player.activeChannel {
@@ -403,13 +509,13 @@ struct ContentView: View {
                         .controlSize(.small)
                     }
                     .padding(12)
-                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
-                    .padding(12)
+                    .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                    .padding(14)
 
                     if let shownChannel = inspected {
                         ScrollView {
                             channelDetails(shownChannel, isCurrentlyPlaying: shownChannel.id == active.id)
-                                .padding([.horizontal, .bottom])
+                                .padding([.horizontal, .bottom], 14)
                         }
                     }
                 } else if !theaterMode {
@@ -423,24 +529,42 @@ struct ContentView: View {
                     )
                     .frame(maxWidth: .infinity)
                     .aspectRatio(16 / 9, contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                    .padding(12)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(.white.opacity(0.10), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
+                    .padding(14)
 
                     if let shownChannel = inspected {
                         ScrollView {
                             channelDetails(shownChannel, isCurrentlyPlaying: shownChannel.id == active.id)
-                                .padding([.horizontal, .bottom])
+                                .padding([.horizontal, .bottom], 14)
                         }
                     }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         } else if let playing {
-            ScrollView {
-                channelDetails(playing, isCurrentlyPlaying: false)
-                    .padding()
+            VStack(spacing: 0) {
+                idlePlayerStage(for: playing)
+                    .frame(maxWidth: .infinity)
+                    .aspectRatio(16 / 9, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(.white.opacity(0.10), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.28), radius: 10, y: 4)
+                    .padding(14)
+
+                ScrollView {
+                    channelDetails(playing, isCurrentlyPlaying: false)
+                        .padding([.horizontal, .bottom], 14)
+                }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         } else {
             ContentUnavailableView(
                 "No channel selected",
@@ -453,25 +577,113 @@ struct ContentView: View {
     }
 
     @ViewBuilder
+    private func idlePlayerStage(for c: Channel) -> some View {
+        let now = guide.now(c)
+        ZStack {
+            RadialGradient(
+                colors: [Color(white: 0.14), Color(white: 0.05)],
+                center: .center,
+                startRadius: 20,
+                endRadius: 500
+            )
+
+            VStack(spacing: 14) {
+                LogoImage(url: c.logo, width: 72, height: 52, placeholderFont: .largeTitle)
+                    .padding(10)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                VStack(spacing: 4) {
+                    Text(c.name)
+                        .font(.title3).bold()
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    if let now {
+                        Text(now.title)
+                            .font(.callout)
+                            .foregroundStyle(.white.opacity(0.72))
+                            .lineLimit(1)
+                    } else {
+                        Text(c.group)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.55))
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        play(c)
+                    } label: {
+                        Label(defaultPlayer == .builtin ? "Play" : "Play in VLC", systemImage: "play.fill")
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .keyboardShortcut(.defaultAction)
+
+                    Button {
+                        if defaultPlayer == .builtin { playInVLC(c) } else { playInBuiltIn(c) }
+                    } label: {
+                        Label(defaultPlayer == .builtin ? "Open in VLC" : "Play in Xstream",
+                              systemImage: defaultPlayer == .builtin ? "arrow.up.forward.app" : "play.rectangle")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.white)
+                    .controlSize(.large)
+                }
+            }
+            .padding(24)
+        }
+    }
+
+    @ViewBuilder
     private func channelDetails(_ c: Channel, isCurrentlyPlaying: Bool) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
-                LogoImage(url: c.logo, width: 72, height: 54, placeholderFont: .largeTitle)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(c.name).font(.title3).bold().textSelection(.enabled)
-                    Text(c.group).font(.caption).foregroundStyle(.secondary)
+                LogoImage(url: c.logo, width: 48, height: 36, placeholderFont: .title3)
+                    .padding(6)
+                    .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(c.name).font(.headline).textSelection(.enabled)
+                    Text(c.group)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(.quaternary.opacity(0.6), in: Capsule())
                 }
+
                 Spacer()
-                Button { toggleFavorite(c) } label: {
-                    Image(systemName: isFavorite(c) ? "star.fill" : "star")
-                        .foregroundStyle(isFavorite(c) ? .yellow : .secondary)
+
+                HStack(spacing: 8) {
+                    if player.activeChannel != nil {
+                        Button(isCurrentlyPlaying ? "Reload" : "Play") { playInBuiltIn(c) }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .keyboardShortcut(.defaultAction)
+                        Button("VLC") { playInVLC(c) }
+                            .controlSize(.small)
+                    }
+
+                    Button { copyURL(c) } label: {
+                        Label(copiedChannelID == c.id ? "Copied" : "Copy URL",
+                              systemImage: copiedChannelID == c.id ? "checkmark" : "link")
+                    }
+                    .controlSize(.small)
+                    .help("Copy stream URL (includes portal credentials)")
+
+                    Button { toggleFavorite(c) } label: {
+                        Image(systemName: isFavorite(c) ? "star.fill" : "star")
+                            .foregroundStyle(isFavorite(c) ? .yellow : .secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help(isFavorite(c) ? "Remove from Favorites" : "Add to Favorites")
                 }
-                .buttonStyle(.borderless)
-                .help(isFavorite(c) ? "Remove from Favorites" : "Add to Favorites")
             }
 
             if let playError {
-                Text(playError).foregroundStyle(.red).textSelection(.enabled)
+                Text(playError).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
 
             GuideView(
@@ -482,27 +694,6 @@ struct ContentView: View {
                     Task { await guide.load(c, from: server, force: true) }
                 } : nil
             )
-
-            HStack(spacing: 8) {
-                if defaultPlayer == .builtin {
-                    Button(isCurrentlyPlaying ? "Reload" : "Play") { playInBuiltIn(c) }
-                        .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.borderedProminent)
-                    Button("Open in VLC") { playInVLC(c) }
-                } else {
-                    Button("Play in VLC") { playInVLC(c) }
-                        .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.borderedProminent)
-                    Button(isCurrentlyPlaying ? "Reload in Xstream" : "Play in Xstream") { playInBuiltIn(c) }
-                }
-                Button("Copy URL") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(c.url.absoluteString, forType: .string)
-                }
-            }
-
-            Text(c.url.absoluteString).font(.caption2)
-                .foregroundStyle(.secondary).textSelection(.enabled)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -517,6 +708,7 @@ struct ContentView: View {
     private func playInBuiltIn(_ c: Channel) {
         playing = c
         playError = nil
+        recordRecent(c)
         player.play(c)
     }
 
@@ -573,6 +765,7 @@ struct ContentView: View {
     private func playInVLC(_ c: Channel) {
         playing = c
         playError = nil
+        recordRecent(c)
         if theaterMode { toggleFullScreen() }
         closeMiniPlayer()
         if player.isActive { player.stop() }
@@ -874,16 +1067,31 @@ struct ChannelRow: View {
 
     var body: some View {
         let now = guide.now(channel)
-        HStack {
-            LogoImage(url: channel.logo, width: 32, height: 24)
-            VStack(alignment: .leading, spacing: 1) {
+        HStack(spacing: 10) {
+            LogoImage(url: channel.logo, width: 32, height: 22)
+                .padding(3)
+                .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
                 Text(channel.name).lineLimit(1)
                 if let now {
-                    Text(now.title).font(.caption2)
-                        .foregroundStyle(.secondary).lineLimit(1)
+                    Text(now.title)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    let total = max(now.stop.timeIntervalSince(now.start), 1)
+                    let frac = min(max(guide.clock.timeIntervalSince(now.start) / total, 0), 1)
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(.quaternary)
+                            Capsule().fill(Color.accentColor.opacity(0.75))
+                                .frame(width: geo.size.width * frac)
+                        }
+                    }
+                    .frame(height: 2)
+                    .padding(.top, 1)
                 }
             }
-            Spacer()
+            Spacer(minLength: 4)
             if isPlaying {
                 Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint).font(.caption)
             }
@@ -891,6 +1099,7 @@ struct ChannelRow: View {
                 Image(systemName: "star.fill").foregroundStyle(.yellow).font(.caption)
             }
         }
+        .padding(.vertical, 2)
         .task(id: "\(channel.id)|\(guide.needsRefresh(channel))") {
             guard let server, guide.needsRefresh(channel) else { return }
             await guide.load(channel, from: server, debounce: .milliseconds(400))
@@ -963,13 +1172,16 @@ struct GuideView: View {
             }
 
             if !shownUpcoming.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
+                Divider().padding(.vertical, 2)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("UP NEXT")
+                        .font(.caption2).bold()
+                        .foregroundStyle(.tertiary)
                     ForEach(shownUpcoming) { p in
-                        HStack(alignment: .firstTextBaseline, spacing: 6) {
-                            Text(span(p)).font(.caption2).monospacedDigit()
-                            Text(p.title).font(.caption2).lineLimit(1)
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(span(p)).font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+                            Text(p.title).font(.caption).lineLimit(1).foregroundStyle(.primary.opacity(0.85))
                         }
-                        .foregroundStyle(.secondary)
                         .help(p.summary)
                     }
                     if upcoming.count > 2 {
@@ -978,11 +1190,18 @@ struct GuideView: View {
                         }
                         .buttonStyle(.link)
                         .font(.caption2)
+                        .padding(.top, 2)
                     }
                 }
-                .padding(.top, 2)
             }
         }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.primary.opacity(0.06), lineWidth: 1)
+        )
     }
 
     private func span(_ p: Programme) -> String {
@@ -1005,7 +1224,6 @@ struct AccountFooterView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Divider()
             HStack(spacing: 6) {
                 Circle().fill(statusColor).frame(width: 7, height: 7)
                 if let info {
@@ -1052,8 +1270,13 @@ struct AccountFooterView: View {
                 }
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(10)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(.primary.opacity(0.06), lineWidth: 1)
+        )
+        .padding(8)
     }
 }
 

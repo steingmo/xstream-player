@@ -961,6 +961,11 @@ struct EmbeddedPlayerView: View {
         .onChange(of: controller.isPlaying) { _, playing in
             if playing { scheduleHide() } else { showControls = true; hideTask?.cancel() }
         }
+        .onChange(of: controlsVisible) { _, visible in
+            if theaterMode && !visible {
+                NSCursor.setHiddenUntilMouseMoves(true)
+            }
+        }
         .onDisappear { hideTask?.cancel() }
         .onKeyPress(.escape) {
             guard theaterMode else { return .ignored }
@@ -1200,9 +1205,15 @@ struct EmbeddedPlayerView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(
-            LinearGradient(colors: [.clear, .black.opacity(0.78)], startPoint: .top, endPoint: .bottom)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .environment(\.colorScheme, .dark)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(.white.opacity(0.14), lineWidth: 1)
         )
+        .shadow(color: .black.opacity(0.45), radius: 12, y: 4)
+        .padding(.horizontal, isMiniPlayer ? 8 : 14)
+        .padding(.bottom, isMiniPlayer ? 8 : 12)
     }
 
     private var volumeIcon: String {

@@ -125,9 +125,11 @@ struct SourceFilter: Codable, Hashable, Sendable {
 struct ChannelIndex: Equatable, Sendable {
     static let allGroup = "All"
     static let favoritesGroup = "\u{2605} Favorites"
+    static let recentsGroup = "Recent"
 
     let channels: [Channel]
     let groups: [String]
+    let categoryGroups: [String]
     let byGroup: [String: [Channel]]
     let byID: [Channel.ID: Channel]
 
@@ -143,20 +145,23 @@ struct ChannelIndex: Equatable, Sendable {
         }
         self.byGroup = grouped
         self.byID = indexed
-        self.groups = [Self.allGroup, Self.favoritesGroup] + filter.sorted(Array(grouped.keys))
+        let sortedCategories = filter.sorted(Array(grouped.keys))
+        self.categoryGroups = sortedCategories
+        self.groups = [Self.allGroup, Self.favoritesGroup] + sortedCategories
     }
 
     /// The channels in `group` before any search query is applied — O(1) for every group.
-    func base(group: String, favorites: [Channel]) -> [Channel] {
+    func base(group: String, favorites: [Channel], recents: [Channel] = []) -> [Channel] {
         switch group {
         case Self.allGroup: return channels
         case Self.favoritesGroup: return favorites
+        case Self.recentsGroup: return recents
         default: return byGroup[group] ?? []
         }
     }
 
-    func filter(group: String, query: String, favorites: [Channel]) -> [Channel] {
-        Self.filter(base(group: group, favorites: favorites), query: query)
+    func filter(group: String, query: String, favorites: [Channel], recents: [Channel] = []) -> [Channel] {
+        Self.filter(base(group: group, favorites: favorites, recents: recents), query: query)
     }
 
     /// Filters a pre-selected pool by `query`. Checks task cancellation periodically so a
@@ -520,6 +525,39 @@ enum Favorites {
 
     static func save(_ favorites: Set<String>) {
         UserDefaults.standard.set(Array(favorites), forKey: key)
+    }
+}
+
+/// Recently played channels per source (ordered newest first, keyed by channel name).
+enum Recents {
+    private static let key = "recentsBySource"
+    static let maxPerSource = 20
+
+    static func load() -> [String: [String]] {
+        (UserDefaults.standard.dictionary(forKey: key) as? [String: [String]]) ?? [:]
+    }
+
+    static func save(_ store: [String: [String]]) {
+        UserDefaults.standard.set(store, forKey: key)
+    }
+
+    static func record(_ sourceID: Source.ID, channelName: String, in store: inout [String: [String]]) {
+        let k = sourceID.uuidString
+        var list = store[k] ?? []
+        list.removeAll { $0 == channelName }
+        list.insert(channelName, at: 0)
+        if list.count > maxPerSource { list.removeLast(list.count - maxPerSource) }
+        store[k] = list
+    }
+
+    static func resolve(_ sourceID: Source.ID, from store: [String: [String]], in channels: [Channel]) -> [Channel] {
+        guard let names = store[sourceID.uuidString], !names.isEmpty else { return [] }
+        var byName: [String: Channel] = [:]
+        let wanted = Set(names)
+        for c in channels where wanted.contains(c.name) && byName[c.name] == nil {
+            byName[c.name] = c
+        }
+        return names.compactMap { byName[$0] }
     }
 }
 
