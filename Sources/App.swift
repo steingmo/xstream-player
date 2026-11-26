@@ -42,6 +42,10 @@ struct ContentView: View {
     @State private var query = ""
     @State private var group = ChannelIndex.allGroup
     @State private var playing: Channel?
+    @State private var player = PlayerController()
+    @State private var theaterMode = false
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @AppStorage("defaultPlayer") private var defaultPlayer = PlaybackTarget.builtin
     /// The source in the add/edit sheet. New sources are not in `sources` until saved.
     @State private var editing: Source?
     @State private var importing = false
@@ -130,7 +134,7 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             List(selection: $selected) {
                 ForEach(sources) { s in
                     Label(s.name, systemImage: {
@@ -143,6 +147,7 @@ struct ContentView: View {
                     Button("Edit…") { editing = s }
                 }
                 Button("Remove", role: .destructive) {
+                    if let selected, ids.contains(selected) { player.stop() }
                     sources.removeAll { ids.contains($0.id) }
                     Store.save(sources)
                 }
@@ -163,7 +168,7 @@ struct ContentView: View {
                 }
                 .labelsHidden().padding(6)
                 // Selecting only shows the channel; double-click or Return plays it. Playing on
-                // select sent every channel the arrow keys passed over to VLC.
+                // select sent every channel the arrow keys passed over to the player.
                 List(shown, selection: Binding(get: { playing?.id }, set: { id in
                     // Deferred: the setter runs inside the table's selection delegate, and
                     // mutating @State there is reentrant.
@@ -171,11 +176,15 @@ struct ContentView: View {
                     Task { playing = c; playError = nil }
                 })) { c in
                     ChannelRow(channel: c, guide: guide, server: currentServer,
-                               isFavorite: isFavorite(c))
+                               isFavorite: isFavorite(c),
+                               isPlaying: player.activeChannel?.id == c.id)
                         .tag(c.id)
                 }
                 .contextMenu(forSelectionType: Channel.ID.self) { ids in
                     if let id = ids.first, let c = index.byID[id] {
+                        Button("Play in Xstream") { playInBuiltIn(c) }
+                        Button("Open in VLC") { playInVLC(c) }
+                        Divider()
                         Button(isFavorite(c) ? "Remove from Favorites" : "Add to Favorites") {
                             toggleFavorite(c)
                         }
@@ -187,6 +196,16 @@ struct ContentView: View {
             .searchable(text: $query, placement: .toolbar, prompt: "Search channels")
             .navigationSplitViewColumnWidth(min: 240, ideal: 320)
             .toolbar {
+                Menu {
+                    Picker("Default Player", selection: $defaultPlayer) {
+                        ForEach(PlaybackTarget.allCases) { target in
+                            Text(target.label).tag(target)
+                        }
+                    }
+                } label: {
+                    Image(systemName: defaultPlayer == .builtin ? "play.rectangle" : "arrow.up.forward.app")
+                }
+                .help("Default player: \(defaultPlayer.label)")
                 Button { editing = currentSource } label: {
                     Image(systemName: "line.3.horizontal.decrease.circle")
                 }
@@ -212,44 +231,17 @@ struct ContentView: View {
                 .help("Export as an M3U playlist")
             }
         } detail: {
-            if let playing {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 12) {
-                        AsyncImage(url: playing.logo) { $0.resizable().scaledToFit() }
-                            placeholder: { Image(systemName: "tv").font(.largeTitle)
-                                .foregroundStyle(.secondary) }
-                            .frame(width: 96, height: 72)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(playing.name).font(.title2).bold().textSelection(.enabled)
-                            Text(playing.group).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    if let playError {
-                        Text(playError).foregroundStyle(.red).textSelection(.enabled)
-                    }
-                    GuideView(guide: guide, channel: playing)
-                    HStack {
-                        Button("Play in VLC") { play(playing) }
-                            .keyboardShortcut(.defaultAction)
-                        Button("Copy URL") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(playing.url.absoluteString, forType: .string)
-                        }
-                    }
-                    Text(playing.url.absoluteString).font(.caption2)
-                        .foregroundStyle(.secondary).textSelection(.enabled)
-                    Spacer()
-                }
-                .padding()
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                ContentUnavailableView("No channel selected", systemImage: "play.rectangle",
-                                       description: Text("Double-click a channel to open it in VLC."))
-            }
+            detailPane
         }
         .onAppear {
             // Deferred: setting selection inside the table's first update is reentrant.
             if selected == nil { Task { selected = sources.first?.id } }
+        }
+        .onChange(of: theaterMode) { _, on in
+            columnVisibility = on ? .detailOnly : .all
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            player.shutdown()
         }
         .task(id: loadKey) { await loadSelected() }
         .onChange(of: currentFilter) { applyFilter() }
@@ -334,9 +326,117 @@ struct ContentView: View {
 
     private static let allHidden = "Every category is hidden. Use the filter button to show some."
 
+    @ViewBuilder
+    private var detailPane: some View {
+        let inspected = playing ?? player.activeChannel
+        if let active = player.activeChannel {
+            VStack(spacing: 0) {
+                EmbeddedPlayerView(
+                    controller: player,
+                    channel: active,
+                    theaterMode: $theaterMode,
+                    onOpenInVLC: { playInVLC(active) }
+                )
+                .frame(maxWidth: .infinity, maxHeight: theaterMode ? .infinity : nil)
+                .aspectRatio(theaterMode ? nil : 16 / 9, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: theaterMode ? 0 : 10))
+                .padding(theaterMode ? 0 : 12)
+
+                if !theaterMode, let shownChannel = inspected {
+                    ScrollView {
+                        channelDetails(shownChannel, isCurrentlyPlaying: shownChannel.id == active.id)
+                            .padding([.horizontal, .bottom])
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(theaterMode ? Color.black : Color.clear)
+        } else if let playing {
+            ScrollView {
+                channelDetails(playing, isCurrentlyPlaying: false)
+                    .padding()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else {
+            ContentUnavailableView(
+                "No channel selected",
+                systemImage: "play.rectangle",
+                description: Text(defaultPlayer == .builtin
+                    ? "Double-click a channel to watch it here, or right-click to open in VLC."
+                    : "Double-click a channel to open it in VLC, or right-click to play in Xstream.")
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func channelDetails(_ c: Channel, isCurrentlyPlaying: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                AsyncImage(url: c.logo) { $0.resizable().scaledToFit() }
+                    placeholder: { Image(systemName: "tv").font(.largeTitle)
+                        .foregroundStyle(.secondary) }
+                    .frame(width: 72, height: 54)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(c.name).font(.title3).bold().textSelection(.enabled)
+                    Text(c.group).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button { toggleFavorite(c) } label: {
+                    Image(systemName: isFavorite(c) ? "star.fill" : "star")
+                        .foregroundStyle(isFavorite(c) ? .yellow : .secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(isFavorite(c) ? "Remove from Favorites" : "Add to Favorites")
+            }
+
+            if let playError {
+                Text(playError).foregroundStyle(.red).textSelection(.enabled)
+            }
+
+            GuideView(guide: guide, channel: c)
+
+            HStack(spacing: 8) {
+                if defaultPlayer == .builtin {
+                    Button(isCurrentlyPlaying ? "Reload" : "Play") { playInBuiltIn(c) }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                    Button("Open in VLC") { playInVLC(c) }
+                } else {
+                    Button("Play in VLC") { playInVLC(c) }
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                    Button(isCurrentlyPlaying ? "Reload in Xstream" : "Play in Xstream") { playInBuiltIn(c) }
+                }
+                Button("Copy URL") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(c.url.absoluteString, forType: .string)
+                }
+            }
+
+            Text(c.url.absoluteString).font(.caption2)
+                .foregroundStyle(.secondary).textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private func play(_ c: Channel) {
+        switch defaultPlayer {
+        case .builtin: playInBuiltIn(c)
+        case .vlc: playInVLC(c)
+        }
+    }
+
+    private func playInBuiltIn(_ c: Channel) {
         playing = c
         playError = nil
+        player.play(c)
+    }
+
+    private func playInVLC(_ c: Channel) {
+        playing = c
+        playError = nil
+        theaterMode = false
+        if player.isActive { player.stop() }
         do { try VLC.play(c.url) } catch { playError = error.localizedDescription }
     }
 
@@ -347,6 +447,7 @@ struct ContentView: View {
 
     private func loadSelected() async {
         // Reset before the guard: removing the selected source must empty the list too.
+        theaterMode = false; player.stop()
         error = nil; allChannels = []; index = .empty; favoriteNames = []; favoriteChannels = []
         shown = []; group = ChannelIndex.allGroup; playing = nil; guide.clear(); searchGeneration += 1
         guard let source = currentSource else { return }
@@ -576,6 +677,7 @@ struct ChannelRow: View {
     let guide: Guide
     let server: Server?
     let isFavorite: Bool
+    var isPlaying = false
 
     var body: some View {
         let now = guide.now(channel)
@@ -591,6 +693,9 @@ struct ChannelRow: View {
                 }
             }
             Spacer()
+            if isPlaying {
+                Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint).font(.caption)
+            }
             if isFavorite {
                 Image(systemName: "star.fill").foregroundStyle(.yellow).font(.caption)
             }
@@ -634,6 +739,13 @@ struct GuideView: View {
                     ProgressView(value: Date().timeIntervalSince(now.start),
                                  total: max(now.stop.timeIntervalSince(now.start), 1))
                         .controlSize(.small)
+                }
+                if !now.summary.isEmpty {
+                    Text(now.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .padding(.top, 2)
                 }
             }
             ForEach(programmes.filter { $0.start > (now?.start ?? .distantPast) }.prefix(2)) { p in

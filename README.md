@@ -1,7 +1,8 @@
 # Xstream
 
 A native macOS player for Xtream Codes IPTV portals and M3U playlists — your
-channel list in a real Mac app, playing in AVKit, VLC, or Infuse.
+channel list and built-in libmpv video player in a real Mac app, with one-click
+handoff to VLC whenever you want it.
 
 - **Xtream portals** — add a server with host, username, and password; live
   channels and the VOD catalogue load with their categories
@@ -16,8 +17,11 @@ channel list in a real Mac app, playing in AVKit, VLC, or Infuse.
   or the filter button above the list), switch Live TV or Movies off entirely,
   untick the categories you never watch, and drag the rest into your own order.
   Turned-off sections aren't even downloaded. TV series aren't loaded yet
-- **Plays in VLC** — double-click a channel (or select it and press Return) and it opens there, with the guide and stream
-  details staying in Xstream
+- **Built-in MPV player + VLC option** — double-click a channel (or press Return)
+  to watch right inside Xstream with hardware-accelerated libmpv playback (HLS,
+  MPEG-TS, MKV, audio/subtitle track switching, VOD scrubbing, and Theater Mode),
+  or hand any stream off to VLC with one click — or set VLC as your default player
+  from the toolbar
 - **Export to M3U** — hand your channels to anything that reads a playlist. The
   list's own search and category filters are the picker: export what's visible,
   just your favorites, or the whole source. Exported URLs contain your portal
