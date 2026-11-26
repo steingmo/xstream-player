@@ -417,7 +417,6 @@ struct ContentView: View {
                     }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea()
 
                 if showFullscreenDrawer {
                     Color.black.opacity(0.25)
