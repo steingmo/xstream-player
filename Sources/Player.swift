@@ -71,8 +71,15 @@ final class MPVOpenGLView: NSOpenGLView {
         needsDisplay = true
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        openGLContext?.update()
+        needsDisplay = true
+    }
+
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+        openGLContext?.update()
         needsDisplay = true
     }
 
@@ -185,6 +192,7 @@ final class MPVContainerView: NSView {
             view.removeFromSuperview()
             view.frame = bounds
             addSubview(view)
+            view.openGLContext?.update()
         }
         view.frame = bounds
         view.needsDisplay = true

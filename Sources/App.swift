@@ -234,6 +234,7 @@ struct ContentView: View {
             detailPane
         }
         .opacity(theaterMode ? 0 : 1)
+        .toolbar(theaterMode ? .hidden : .visible, for: .windowToolbar)
 
         if theaterMode, let active = player.activeChannel {
             EmbeddedPlayerView(
@@ -251,8 +252,11 @@ struct ContentView: View {
             // Deferred: setting selection inside the table's first update is reentrant.
             if selected == nil { Task { selected = sources.first?.id } }
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { _ in
-            if theaterMode { theaterMode = false }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { note in
+            if theaterMode {
+                theaterMode = false
+                (note.object as? NSWindow)?.toolbar?.isVisible = true
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             player.shutdown()
@@ -450,11 +454,16 @@ struct ContentView: View {
 
     private func toggleFullScreen() {
         let entering = !theaterMode
+        let window = NSApp.keyWindow
         theaterMode = entering
-        if let window = NSApp.keyWindow {
+        window?.toolbar?.isVisible = !entering
+        if let window {
             let isNativeFS = window.styleMask.contains(.fullScreen)
             if entering != isNativeFS {
-                window.toggleFullScreen(nil)
+                // Defer one tick so the reparented OpenGL view updates before the fullscreen snapshot.
+                DispatchQueue.main.async {
+                    window.toggleFullScreen(nil)
+                }
             }
         }
     }
