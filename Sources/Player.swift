@@ -554,24 +554,39 @@ final class MPVHostView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        wantsLayer = true
         metalLayer.framebufferOnly = true
         metalLayer.backgroundColor = NSColor.black.cgColor
+        metalLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         metalLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
-        layer = metalLayer
+        wantsLayer = true
+        layerContentsRedrawPolicy = .duringViewResize
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
+    override func makeBackingLayer() -> CALayer {
+        metalLayer
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        syncLayerSize()
+    }
+
     override func layout() {
         super.layout()
-        updateDrawableSize()
+        syncLayerSize()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        syncLayerSize()
     }
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
-        updateDrawableSize()
+        syncLayerSize()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -582,15 +597,18 @@ final class MPVHostView: NSView {
         }
     }
 
-    private func updateDrawableSize() {
+    func syncLayerSize() {
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let w = (bounds.width * scale).rounded()
+        let h = (bounds.height * scale).rounded()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         metalLayer.contentsScale = scale
         metalLayer.frame = bounds
-        let w = bounds.width * scale
-        let h = bounds.height * scale
         if w > 1 && h > 1 {
             metalLayer.drawableSize = CGSize(width: w, height: h)
         }
+        CATransaction.commit()
     }
 }
 
@@ -601,12 +619,14 @@ struct MPVVideoSurface: NSViewRepresentable {
     func makeNSView(context: Context) -> MPVHostView {
         let view = MPVHostView()
         view.onDoubleClick = onDoubleClick
+        view.syncLayerSize()
         controller.attach(to: view.metalLayer)
         return view
     }
 
     func updateNSView(_ nsView: MPVHostView, context: Context) {
         nsView.onDoubleClick = onDoubleClick
+        nsView.syncLayerSize()
     }
 }
 
