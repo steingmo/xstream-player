@@ -44,7 +44,6 @@ struct ContentView: View {
     @State private var playing: Channel?
     @State private var player = PlayerController()
     @State private var theaterMode = false
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @AppStorage("defaultPlayer") private var defaultPlayer = PlaybackTarget.builtin
     /// The source in the add/edit sheet. New sources are not in `sources` until saved.
     @State private var editing: Source?
@@ -134,8 +133,9 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            List(selection: $selected) {
+        ZStack {
+            NavigationSplitView {
+                List(selection: $selected) {
                 ForEach(sources) { s in
                     Label(s.name, systemImage: {
                         if case .xtream = s.kind { return "antenna.radiowaves.left.and.right" } else { return "doc.text" }
@@ -233,12 +233,26 @@ struct ContentView: View {
         } detail: {
             detailPane
         }
+        .opacity(theaterMode ? 0 : 1)
+
+        if theaterMode, let active = player.activeChannel {
+            EmbeddedPlayerView(
+                controller: player,
+                channel: active,
+                theaterMode: $theaterMode,
+                onOpenInVLC: { playInVLC(active) },
+                onToggleFullScreen: toggleFullScreen
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .ignoresSafeArea()
+        }
+        }
         .onAppear {
             // Deferred: setting selection inside the table's first update is reentrant.
             if selected == nil { Task { selected = sources.first?.id } }
         }
-        .onChange(of: theaterMode) { _, on in
-            columnVisibility = on ? .detailOnly : .all
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { _ in
+            if theaterMode { theaterMode = false }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             player.shutdown()
@@ -331,26 +345,28 @@ struct ContentView: View {
         let inspected = playing ?? player.activeChannel
         if let active = player.activeChannel {
             VStack(spacing: 0) {
-                EmbeddedPlayerView(
-                    controller: player,
-                    channel: active,
-                    theaterMode: $theaterMode,
-                    onOpenInVLC: { playInVLC(active) }
-                )
-                .frame(maxWidth: .infinity, maxHeight: theaterMode ? .infinity : nil)
-                .aspectRatio(theaterMode ? nil : 16 / 9, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: theaterMode ? 0 : 10))
-                .padding(theaterMode ? 0 : 12)
+                if !theaterMode {
+                    EmbeddedPlayerView(
+                        controller: player,
+                        channel: active,
+                        theaterMode: $theaterMode,
+                        onOpenInVLC: { playInVLC(active) },
+                        onToggleFullScreen: toggleFullScreen
+                    )
+                    .frame(maxWidth: .infinity)
+                    .aspectRatio(16 / 9, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .padding(12)
 
-                if !theaterMode, let shownChannel = inspected {
-                    ScrollView {
-                        channelDetails(shownChannel, isCurrentlyPlaying: shownChannel.id == active.id)
-                            .padding([.horizontal, .bottom])
+                    if let shownChannel = inspected {
+                        ScrollView {
+                            channelDetails(shownChannel, isCurrentlyPlaying: shownChannel.id == active.id)
+                                .padding([.horizontal, .bottom])
+                        }
                     }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .background(theaterMode ? Color.black : Color.clear)
         } else if let playing {
             ScrollView {
                 channelDetails(playing, isCurrentlyPlaying: false)
@@ -432,10 +448,21 @@ struct ContentView: View {
         player.play(c)
     }
 
+    private func toggleFullScreen() {
+        let entering = !theaterMode
+        theaterMode = entering
+        if let window = NSApp.keyWindow {
+            let isNativeFS = window.styleMask.contains(.fullScreen)
+            if entering != isNativeFS {
+                window.toggleFullScreen(nil)
+            }
+        }
+    }
+
     private func playInVLC(_ c: Channel) {
         playing = c
         playError = nil
-        theaterMode = false
+        if theaterMode { toggleFullScreen() }
         if player.isActive { player.stop() }
         do { try VLC.play(c.url) } catch { playError = error.localizedDescription }
     }

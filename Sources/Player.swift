@@ -1,6 +1,7 @@
 import AppKit
 import Libmpv
-import QuartzCore
+import OpenGL.GL
+import OpenGL.GL3
 import SwiftUI
 
 // MARK: - Preferences
@@ -24,31 +25,200 @@ struct MediaTrack: Identifiable, Hashable {
     let selected: Bool
 }
 
-// MARK: - MoltenVK Metal Layer
+// MARK: - OpenGL Video View (vo=libmpv)
 
-/// CAMetalLayer with MoltenVK workarounds: ignore transient 1x1 drawableSize resets
-/// (prevents flicker) and ensure EDR toggles happen on the main thread.
-final class MPVMetalLayer: CAMetalLayer {
-    override var drawableSize: CGSize {
-        get { super.drawableSize }
-        set {
-            if Int(newValue.width) > 1 && Int(newValue.height) > 1 {
-                super.drawableSize = newValue
-            }
+/// Renders libmpv frames via mpv_render_context into an NSOpenGLView.
+/// Unlike MPVKit's moltenvk context (which doesn't handle VO_EVENT_RESIZE), every draw
+/// passes the exact current Retina backing dimensions to libmpv, so live window resizing
+/// and fullscreen transitions scale smoothly at 60 fps.
+final class MPVOpenGLView: NSOpenGLView {
+    var onDoubleClick: (() -> Void)?
+    private var renderContext: OpaquePointer?
+    private var defaultFBO: GLint = 0
+
+    override class func defaultPixelFormat() -> NSOpenGLPixelFormat {
+        let attrs: [NSOpenGLPixelFormatAttribute] = [
+            NSOpenGLPixelFormatAttribute(NSOpenGLPFAOpenGLProfile),
+            NSOpenGLPixelFormatAttribute(NSOpenGLProfileVersion3_2Core),
+            NSOpenGLPixelFormatAttribute(NSOpenGLPFADoubleBuffer),
+            NSOpenGLPixelFormatAttribute(NSOpenGLPFAAccelerated),
+            NSOpenGLPixelFormatAttribute(NSOpenGLPFAAllowOfflineRenderers),
+            NSOpenGLPixelFormatAttribute(NSOpenGLPFAColorSize), NSOpenGLPixelFormatAttribute(32),
+            NSOpenGLPixelFormatAttribute(NSOpenGLPFADepthSize), NSOpenGLPixelFormatAttribute(24),
+            NSOpenGLPixelFormatAttribute(0),
+        ]
+        return NSOpenGLPixelFormat(attributes: attrs) ?? super.defaultPixelFormat()
+    }
+
+    init() {
+        super.init(frame: .zero, pixelFormat: Self.defaultPixelFormat())!
+        wantsBestResolutionOpenGLSurface = true
+        autoresizingMask = [.width, .height]
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isOpaque: Bool { true }
+
+    override func reshape() {
+        super.reshape()
+        needsDisplay = true
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsDisplay = true
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            onDoubleClick?()
+        } else {
+            super.mouseDown(with: event)
         }
     }
 
-    override var wantsExtendedDynamicRangeContent: Bool {
-        get { super.wantsExtendedDynamicRangeContent }
-        set {
-            if Thread.isMainThread {
-                super.wantsExtendedDynamicRangeContent = newValue
-            } else {
-                DispatchQueue.main.sync {
-                    super.wantsExtendedDynamicRangeContent = newValue
+    func attachRenderContext(mpv: OpaquePointer) -> CInt {
+        guard renderContext == nil, let ctx = openGLContext, let cgl = ctx.cglContextObj else { return 0 }
+        CGLLockContext(cgl)
+        defer { CGLUnlockContext(cgl) }
+        ctx.makeCurrentContext()
+
+        let api = UnsafeMutableRawPointer(mutating: (MPV_RENDER_API_TYPE_OPENGL as NSString).utf8String)
+        var glInit = mpv_opengl_init_params(
+            get_proc_address: { _, name in
+                guard let name else { return nil }
+                let sym = CFStringCreateWithCString(kCFAllocatorDefault, name, CFStringBuiltInEncodings.ASCII.rawValue)
+                guard let bundle = CFBundleGetBundleWithIdentifier("com.apple.opengl" as CFString) else { return nil }
+                return CFBundleGetFunctionPointerForName(bundle, sym)
+            },
+            get_proc_address_ctx: nil
+        )
+
+        var created: OpaquePointer?
+        let status: CInt = withUnsafeMutablePointer(to: &glInit) { glPtr in
+            var params = [
+                mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE, data: api),
+                mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, data: glPtr),
+                mpv_render_param(),
+            ]
+            return mpv_render_context_create(&created, mpv, &params)
+        }
+
+        guard status >= 0, let created else { return status }
+        renderContext = created
+
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        mpv_render_context_set_update_callback(created, { rawCtx in
+            guard let rawCtx else { return }
+            let view = Unmanaged<MPVOpenGLView>.fromOpaque(rawCtx).takeUnretainedValue()
+            DispatchQueue.main.async {
+                view.needsDisplay = true
+            }
+        }, selfPtr)
+
+        return status
+    }
+
+    func detachRenderContext() {
+        guard let rc = renderContext else { return }
+        renderContext = nil
+        mpv_render_context_set_update_callback(rc, nil, nil)
+        if let ctx = openGLContext, let cgl = ctx.cglContextObj {
+            CGLLockContext(cgl)
+            ctx.makeCurrentContext()
+            mpv_render_context_free(rc)
+            CGLUnlockContext(cgl)
+        } else {
+            mpv_render_context_free(rc)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = openGLContext, let cgl = ctx.cglContextObj else { return }
+        CGLLockContext(cgl)
+        defer { CGLUnlockContext(cgl) }
+        ctx.makeCurrentContext()
+
+        let backing = convertToBacking(bounds)
+        let w = Int32(max(backing.width.rounded(), 1))
+        let h = Int32(max(backing.height.rounded(), 1))
+
+        glViewport(0, 0, GLsizei(w), GLsizei(h))
+        glClearColor(0, 0, 0, 1)
+        glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
+
+        if let rc = renderContext {
+            glGetIntegerv(GLenum(GL_FRAMEBUFFER_BINDING), &defaultFBO)
+            var fbo = mpv_opengl_fbo(fbo: defaultFBO, w: w, h: h, internal_format: 0)
+            var flip: CInt = 1
+            withUnsafeMutablePointer(to: &fbo) { fboPtr in
+                withUnsafeMutablePointer(to: &flip) { flipPtr in
+                    var params = [
+                        mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_FBO, data: fboPtr),
+                        mpv_render_param(type: MPV_RENDER_PARAM_FLIP_Y, data: flipPtr),
+                        mpv_render_param(),
+                    ]
+                    mpv_render_context_render(rc, &params)
                 }
             }
         }
+
+        ctx.flushBuffer()
+    }
+}
+
+/// Thin container owned by SwiftUI that reparents the single shared MPVOpenGLView so
+/// toggling Theater Mode / Fullscreen never tears down the video context or interrupts playback.
+final class MPVContainerView: NSView {
+    private weak var videoView: MPVOpenGLView?
+
+    func mount(_ view: MPVOpenGLView) {
+        videoView = view
+        if view.superview !== self {
+            view.removeFromSuperview()
+            view.frame = bounds
+            addSubview(view)
+        }
+        view.frame = bounds
+        view.needsDisplay = true
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        videoView?.frame = bounds
+        videoView?.needsDisplay = true
+    }
+
+    override func layout() {
+        super.layout()
+        videoView?.frame = bounds
+        videoView?.needsDisplay = true
+    }
+}
+
+struct MPVVideoSurface: NSViewRepresentable {
+    let controller: PlayerController
+    let onDoubleClick: () -> Void
+
+    func makeNSView(context: Context) -> MPVContainerView {
+        let container = MPVContainerView()
+        let video = controller.ensureVideoView()
+        video.onDoubleClick = onDoubleClick
+        container.mount(video)
+        return container
+    }
+
+    func updateNSView(_ nsView: MPVContainerView, context: Context) {
+        let video = controller.ensureVideoView()
+        video.onDoubleClick = onDoubleClick
+        nsView.mount(video)
     }
 }
 
@@ -93,7 +263,7 @@ final class PlayerController {
 
     @ObservationIgnored private let mpvQueue = DispatchQueue(label: "com.steingrimosa.xstream.mpv", qos: .userInitiated)
     @ObservationIgnored private nonisolated(unsafe) var mpv: OpaquePointer?
-    @ObservationIgnored private var attachedLayer: MPVMetalLayer?
+    @ObservationIgnored private var videoView: MPVOpenGLView?
     @ObservationIgnored private var pendingURL: URL?
     @ObservationIgnored private var lastPosUpdate: TimeInterval = 0
     @ObservationIgnored private var videoHeight: Int64 = 0
@@ -106,17 +276,19 @@ final class PlayerController {
         self.isMuted = UserDefaults.standard.bool(forKey: Self.mutedKey)
     }
 
-    func attach(to layer: MPVMetalLayer) {
-        if attachedLayer === layer && mpv != nil { return }
-        attachedLayer = layer
-        if mpv != nil {
-            shutdown()
+    func ensureVideoView() -> MPVOpenGLView {
+        if let existing = videoView {
+            if mpv == nil { initializeMPV(view: existing) }
+            return existing
         }
-        initializeMPV(layer: layer)
+        let view = MPVOpenGLView()
+        videoView = view
+        initializeMPV(view: view)
         if let url = pendingURL {
             pendingURL = nil
             sendLoadFile(url)
         }
+        return view
     }
 
     func play(_ channel: Channel) {
@@ -201,19 +373,20 @@ final class PlayerController {
     }
 
     func shutdown() {
-        let queue = mpvQueue
-        queue.sync {
+        // Detach the OpenGL render context on the main thread before destroying mpv.
+        videoView?.detachRenderContext()
+        mpvQueue.sync {
             guard let handle = self.mpv else { return }
             mpv_set_wakeup_callback(handle, nil, nil)
             mpv_terminate_destroy(handle)
             self.mpv = nil
         }
-        attachedLayer = nil
+        videoView = nil
     }
 
     // MARK: - libmpv Setup & Commands
 
-    private func initializeMPV(layer: MPVMetalLayer) {
+    private func initializeMPV(view: MPVOpenGLView) {
         guard let handle = mpv_create() else {
             errorMessage = "Failed to initialize video engine."
             return
@@ -238,12 +411,8 @@ final class PlayerController {
         mpv_set_option_string(handle, "osc", "no")
         mpv_set_option_string(handle, "ytdl", "no")
 
-        var wid = Int64(Int(bitPattern: Unmanaged.passUnretained(layer).toOpaque()))
-        mpv_set_option(handle, "wid", MPV_FORMAT_INT64, &wid)
-        mpv_set_option_string(handle, "vo", "gpu-next")
-        mpv_set_option_string(handle, "gpu-api", "vulkan")
-        mpv_set_option_string(handle, "gpu-context", "moltenvk")
-        mpv_set_option_string(handle, "hwdec", "videotoolbox")
+        mpv_set_option_string(handle, "vo", "libmpv")
+        mpv_set_option_string(handle, "hwdec", "auto-safe")
         mpv_set_option_string(handle, "keep-open", "no")
         mpv_set_option_string(handle, "cache", "yes")
         mpv_set_option_string(handle, "demuxer-max-bytes", "64MiB")
@@ -262,6 +431,14 @@ final class PlayerController {
             let err = String(cString: mpv_error_string(status))
             mpv_terminate_destroy(handle)
             errorMessage = "Video engine failed to start: \(err)"
+            return
+        }
+
+        let glStatus = view.attachRenderContext(mpv: handle)
+        guard glStatus >= 0 else {
+            let err = String(cString: mpv_error_string(glStatus))
+            mpv_terminate_destroy(handle)
+            errorMessage = "Video renderer failed to start: \(err)"
             return
         }
 
@@ -546,90 +723,6 @@ final class PlayerController {
     }
 }
 
-// MARK: - NSView Video Surface
-
-final class MPVHostView: NSView {
-    let metalLayer = MPVMetalLayer()
-    var onDoubleClick: (() -> Void)?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        metalLayer.framebufferOnly = true
-        metalLayer.backgroundColor = NSColor.black.cgColor
-        metalLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        metalLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
-        wantsLayer = true
-        layerContentsRedrawPolicy = .duringViewResize
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func makeBackingLayer() -> CALayer {
-        metalLayer
-    }
-
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
-        syncLayerSize()
-    }
-
-    override func layout() {
-        super.layout()
-        syncLayerSize()
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        syncLayerSize()
-    }
-
-    override func viewDidChangeBackingProperties() {
-        super.viewDidChangeBackingProperties()
-        syncLayerSize()
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 {
-            onDoubleClick?()
-        } else {
-            super.mouseDown(with: event)
-        }
-    }
-
-    func syncLayerSize() {
-        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-        let w = (bounds.width * scale).rounded()
-        let h = (bounds.height * scale).rounded()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        metalLayer.contentsScale = scale
-        metalLayer.frame = bounds
-        if w > 1 && h > 1 {
-            metalLayer.drawableSize = CGSize(width: w, height: h)
-        }
-        CATransaction.commit()
-    }
-}
-
-struct MPVVideoSurface: NSViewRepresentable {
-    let controller: PlayerController
-    let onDoubleClick: () -> Void
-
-    func makeNSView(context: Context) -> MPVHostView {
-        let view = MPVHostView()
-        view.onDoubleClick = onDoubleClick
-        view.syncLayerSize()
-        controller.attach(to: view.metalLayer)
-        return view
-    }
-
-    func updateNSView(_ nsView: MPVHostView, context: Context) {
-        nsView.onDoubleClick = onDoubleClick
-        nsView.syncLayerSize()
-    }
-}
-
 // MARK: - Embedded Player Stage & HUD
 
 struct EmbeddedPlayerView: View {
@@ -637,6 +730,7 @@ struct EmbeddedPlayerView: View {
     let channel: Channel
     @Binding var theaterMode: Bool
     let onOpenInVLC: () -> Void
+    let onToggleFullScreen: () -> Void
 
     @State private var showControls = true
     @State private var hideTask: Task<Void, Never>?
@@ -651,7 +745,7 @@ struct EmbeddedPlayerView: View {
         ZStack {
             Color.black
             MPVVideoSurface(controller: controller) {
-                withAnimation(.easeInOut(duration: 0.2)) { theaterMode.toggle() }
+                onToggleFullScreen()
             }
 
             // Center state overlay (loading, buffering, or error)
@@ -711,7 +805,7 @@ struct EmbeddedPlayerView: View {
         .onDisappear { hideTask?.cancel() }
         .onKeyPress(.escape) {
             guard theaterMode else { return .ignored }
-            withAnimation(.easeInOut(duration: 0.2)) { theaterMode = false }
+            onToggleFullScreen()
             return .handled
         }
     }
@@ -757,7 +851,7 @@ struct EmbeddedPlayerView: View {
             .help("Hand off this stream to VLC")
 
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) { theaterMode.toggle() }
+                onToggleFullScreen()
             } label: {
                 Image(systemName: theaterMode ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }
@@ -766,7 +860,7 @@ struct EmbeddedPlayerView: View {
             .padding(6)
             .background(.black.opacity(0.45), in: Circle())
             .keyboardShortcut("f", modifiers: [.command, .shift])
-            .help(theaterMode ? "Exit Theater Mode (⇧⌘F)" : "Theater Mode (⇧⌘F or double-click video)")
+            .help(theaterMode ? "Exit Fullscreen (⇧⌘F or Esc)" : "Fullscreen (⇧⌘F or double-click video)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -908,7 +1002,7 @@ struct EmbeddedPlayerView: View {
                 }
 
                 Button {
-                    theaterMode = false
+                    if theaterMode { onToggleFullScreen() }
                     controller.stop()
                 } label: {
                     Image(systemName: "stop.fill")
