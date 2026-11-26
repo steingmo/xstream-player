@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Model
 
-struct Channel: Identifiable, Hashable, Sendable {
+struct Channel: Identifiable, Hashable, Sendable, Codable {
     let id: String
     let name: String
     let group: String
@@ -234,9 +234,119 @@ enum Store {
     }
 }
 
+/// Per-source disk cache of fetched channels so Xstream opens instantaneously on large
+/// portals while refreshing in the background. Stored 0600 because stream URLs embed
+/// portal credentials.
+enum ChannelCache {
+    private struct Snapshot: Codable {
+        let live: Bool
+        let movies: Bool
+        let channels: [Channel]
+    }
+
+    static let directory: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Xstream/cache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    private static func url(for sourceID: Source.ID) -> URL {
+        directory.appendingPathComponent("\(sourceID.uuidString).json")
+    }
+
+    static func load(sourceID: Source.ID, live: Bool, movies: Bool) async -> [Channel]? {
+        let file = url(for: sourceID)
+        return await Task.detached(priority: .userInitiated) {
+            guard let data = try? Data(contentsOf: file),
+                  let snap = try? JSONDecoder().decode(Snapshot.self, from: data),
+                  snap.live == live && snap.movies == movies else { return nil }
+            return snap.channels
+        }.value
+    }
+
+    static func save(_ channels: [Channel], sourceID: Source.ID, live: Bool, movies: Bool) {
+        let file = url(for: sourceID)
+        let snap = Snapshot(live: live, movies: movies, channels: channels)
+        Task.detached(priority: .utility) {
+            guard let data = try? JSONEncoder().encode(snap) else { return }
+            FileManager.default.createFile(atPath: file.path, contents: data,
+                                           attributes: [.posixPermissions: 0o600])
+        }
+    }
+
+    static func remove(sourceID: Source.ID) {
+        try? FileManager.default.removeItem(at: url(for: sourceID))
+    }
+}
+
 // MARK: - Xtream Codes API
 
+/// Xtream panels inconsistently encode IDs, timestamps, and flags as either strings or
+/// numbers. Decoding loosely into a String avoids failing on either representation.
+struct LossyString: Decodable {
+    let value: String?
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { value = nil; return }
+        if let s = try? c.decode(String.self) { value = s.isEmpty ? nil : s; return }
+        if let i = try? c.decode(Int64.self) { value = String(i); return }
+        if let d = try? c.decode(Double.self) { value = String(d); return }
+        if let b = try? c.decode(Bool.self) { value = b ? "1" : "0"; return }
+        value = nil
+    }
+}
+
 enum Xtream {
+    private struct CategoryRow: Decodable {
+        let category_id: LossyString?
+        let category_name: LossyString?
+    }
+
+    private struct LiveRow: Decodable {
+        let stream_id: LossyString?
+        let name: LossyString?
+        let category_id: LossyString?
+        let stream_icon: LossyString?
+    }
+
+    private struct VodRow: Decodable {
+        let stream_id: LossyString?
+        let name: LossyString?
+        let category_id: LossyString?
+        let stream_icon: LossyString?
+        let container_extension: LossyString?
+    }
+
+    private struct EPGRow: Decodable {
+        let id: LossyString?
+        let title: LossyString?
+        let description: LossyString?
+        let start_timestamp: LossyString?
+        let stop_timestamp: LossyString?
+    }
+
+    private struct EPGEnvelope: Decodable {
+        let epg_listings: [EPGRow]?
+    }
+
+    private struct AccountEnvelope: Decodable {
+        struct UserInfo: Decodable {
+            let status: LossyString?
+            let exp_date: LossyString?
+            let active_cons: LossyString?
+            let max_connections: LossyString?
+            let is_trial: LossyString?
+            let allowed_output_formats: [String]?
+        }
+        struct ServerInfo: Decodable {
+            let timezone: LossyString?
+        }
+        let user_info: UserInfo?
+        let server_info: ServerInfo?
+    }
+
     static func base(_ s: Server) -> String {
         var h = s.host.trimmingCharacters(in: .whitespaces)
         while h.hasSuffix("/") { h.removeLast() }
@@ -255,22 +365,28 @@ enum Xtream {
         return nil
     }
 
-    private static func rows(_ s: Server, _ action: String, _ extra: String = "") async throws -> [[String: Any]] {
-        let str = "\(base(s))/player_api.php?username=\(esc(s.username))&password=\(esc(s.password))&action=\(action)\(extra)"
+    private static func fetch(_ s: Server, _ action: String? = nil, _ extra: String = "") async throws -> Data {
+        var str = "\(base(s))/player_api.php?username=\(esc(s.username))&password=\(esc(s.password))"
+        if let action { str += "&action=\(action)\(extra)" }
         guard let u = URL(string: str) else { throw Err("Bad server address") }
         let (d, r) = try await URLSession.shared.data(from: u)
-        if let h = r as? HTTPURLResponse, h.statusCode != 200 { throw Err("HTTP \(h.statusCode) on \(action)") }
-        let json = try? JSONSerialization.jsonObject(with: d)
-        // Stream lists come back as a bare array; get_short_epg wraps its array in an object.
-        if let a = json as? [[String: Any]] { return a }
-        if let o = json as? [String: Any],
-           let a = o.values.compactMap({ $0 as? [[String: Any]] }).first { return a }
-        throw Err("Unexpected reply to \(action) — wrong credentials or not an Xtream server?")
+        if let h = r as? HTTPURLResponse, h.statusCode != 200 {
+            throw Err("HTTP \(h.statusCode)\(action.map { " on \($0)" } ?? "")")
+        }
+        return d
     }
 
-    private static func names(_ rs: [[String: Any]]) -> [String: String] {
+    private static func decodeArray<T: Decodable>(_ type: [T].Type, from data: Data, action: String) throws -> [T] {
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            throw Err("Unexpected reply to \(action) — wrong credentials or not an Xtream server?")
+        }
+    }
+
+    private static func names(_ rs: [CategoryRow]) -> [String: String] {
         Dictionary(rs.compactMap { r -> (String, String)? in
-            guard let i = string(r, "category_id"), let n = string(r, "category_name") else { return nil }
+            guard let i = r.category_id?.value, let n = r.category_name?.value else { return nil }
             return (i, n)
         }, uniquingKeysWith: { a, _ in a })
     }
@@ -278,70 +394,66 @@ enum Xtream {
     /// Category names as the channel list groups them, in the provider's order. Two small
     /// requests, so the server sheet can offer them before any stream list is downloaded.
     static func categories(_ s: Server) async throws -> [String] {
-        async let liveCats = rows(s, "get_live_categories")
-        async let vodCats = rows(s, "get_vod_categories")
-        func list(_ rs: [[String: Any]], _ prefix: String) -> [String] {
-            rs.compactMap { string($0, "category_name").map { prefix + $0 } }
-        }
-        return list(try await liveCats, "") + list(try await vodCats, SourceFilter.moviePrefix)
+        async let liveData = fetch(s, "get_live_categories")
+        async let vodData = fetch(s, "get_vod_categories")
+        let liveCats = try decodeArray([CategoryRow].self, from: try await liveData, action: "get_live_categories")
+        let vodCats = try decodeArray([CategoryRow].self, from: try await vodData, action: "get_vod_categories")
+        return liveCats.compactMap { $0.category_name?.value }
+            + vodCats.compactMap { $0.category_name?.value.map { SourceFilter.moviePrefix + $0 } }
     }
 
     /// Live channels + VOD movies. Series are skipped: each one needs its own episode fetch.
     /// A section that is switched off is not downloaded at all; the VOD list is the big one.
     static func channels(_ s: Server, live wantLive: Bool = true,
                          movies wantMovies: Bool = true) async throws -> [Channel] {
-        let none: [[String: Any]] = []
-        async let liveCats = wantLive ? rows(s, "get_live_categories") : none
-        async let live = wantLive ? rows(s, "get_live_streams") : none
-        async let vodCats = wantMovies ? rows(s, "get_vod_categories") : none
-        async let vod = wantMovies ? rows(s, "get_vod_streams") : none
+        async let liveCatsData: Data? = wantLive ? try await fetch(s, "get_live_categories") : nil
+        async let liveData: Data? = wantLive ? try await fetch(s, "get_live_streams") : nil
+        async let vodCatsData: Data? = wantMovies ? try await fetch(s, "get_vod_categories") : nil
+        async let vodData: Data? = wantMovies ? try await fetch(s, "get_vod_streams") : nil
+
+        let lc = try await liveCatsData.map { try names(decodeArray([CategoryRow].self, from: $0, action: "get_live_categories")) } ?? [:]
+        let liveRows = try await liveData.map { try decodeArray([LiveRow].self, from: $0, action: "get_live_streams") } ?? []
+        let vc = try await vodCatsData.map { try names(decodeArray([CategoryRow].self, from: $0, action: "get_vod_categories")) } ?? [:]
+        let vodRows = try await vodData.map { try decodeArray([VodRow].self, from: $0, action: "get_vod_streams") } ?? []
 
         let b = base(s), u = esc(s.username), p = esc(s.password)
-        let lc = names(try await liveCats)
-        let liveRows = try await live
-        let vc = names(try await vodCats)
-        let vodRows = try await vod
-
         var out: [Channel] = []
         out.reserveCapacity(liveRows.count + vodRows.count)
 
         for r in liveRows {
-            guard let id = string(r, "stream_id"), let name = string(r, "name"),
+            guard let id = r.stream_id?.value, let name = r.name?.value,
                   // .m3u8 rather than .ts: both work in VLC, and HLS survives a flaky
                   // connection better. Panels with HLS disabled would need .ts here.
                   let url = URL(string: "\(b)/live/\(u)/\(p)/\(id).m3u8") else { continue }
             out.append(Channel(id: "live-\(id)", name: name,
-                               group: lc[string(r, "category_id") ?? ""] ?? "Live",
-                               logo: URL(string: string(r, "stream_icon") ?? ""), url: url,
+                               group: lc[r.category_id?.value ?? ""] ?? "Live",
+                               logo: URL(string: r.stream_icon?.value ?? ""), url: url,
                                streamID: id))
         }
 
         for r in vodRows {
-            guard let id = string(r, "stream_id"), let name = string(r, "name") else { continue }
-            let ext = string(r, "container_extension") ?? "mp4"
+            guard let id = r.stream_id?.value, let name = r.name?.value else { continue }
+            let ext = r.container_extension?.value ?? "mp4"
             guard let url = URL(string: "\(b)/movie/\(u)/\(p)/\(id).\(ext)") else { continue }
             out.append(Channel(id: "vod-\(id)", name: name,
-                               group: SourceFilter.moviePrefix + (vc[string(r, "category_id") ?? ""] ?? "All"),
-                               logo: URL(string: string(r, "stream_icon") ?? ""), url: url))
+                               group: SourceFilter.moviePrefix + (vc[r.category_id?.value ?? ""] ?? "All"),
+                               logo: URL(string: r.stream_icon?.value ?? ""), url: url))
         }
         return out
     }
 
     /// Parses `user_info` + `server_info` from `player_api.php` (no action).
     static func parseAccountInfo(_ data: Data) -> AccountInfo? {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let user = root["user_info"] as? [String: Any] else { return nil }
-        let server = root["server_info"] as? [String: Any] ?? [:]
+        guard let env = try? JSONDecoder().decode(AccountEnvelope.self, from: data),
+              let user = env.user_info else { return nil }
 
-        let status = string(user, "status") ?? "Unknown"
-        let expSecs = string(user, "exp_date").flatMap(Double.init)
+        let status = user.status?.value ?? "Unknown"
+        let expSecs = user.exp_date?.value.flatMap(Double.init)
         let expiresAt: Date? = (expSecs != nil && expSecs! > 0) ? Date(timeIntervalSince1970: expSecs!) : nil
-        let activeCons = string(user, "active_cons").flatMap(Int.init)
-        let maxCons = string(user, "max_connections").flatMap(Int.init)
-        let trialStr = string(user, "is_trial")?.lowercased() ?? "0"
+        let activeCons = user.active_cons?.value.flatMap(Int.init)
+        let maxCons = user.max_connections?.value.flatMap(Int.init)
+        let trialStr = user.is_trial?.value?.lowercased() ?? "0"
         let isTrial = trialStr == "1" || trialStr == "true"
-        let formats = (user["allowed_output_formats"] as? [String]) ?? []
-        let timezone = string(server, "timezone")
 
         return AccountInfo(
             status: status,
@@ -349,37 +461,47 @@ enum Xtream {
             activeConnections: activeCons,
             maxConnections: maxCons,
             isTrial: isTrial,
-            allowedFormats: formats,
-            timezone: timezone
+            allowedFormats: user.allowed_output_formats ?? [],
+            timezone: env.server_info?.timezone?.value
         )
     }
 
     static func accountInfo(_ s: Server) async throws -> AccountInfo {
-        let str = "\(base(s))/player_api.php?username=\(esc(s.username))&password=\(esc(s.password))"
-        guard let u = URL(string: str) else { throw Err("Bad server address") }
-        let (d, r) = try await URLSession.shared.data(from: u)
-        if let h = r as? HTTPURLResponse, h.statusCode != 200 { throw Err("HTTP \(h.statusCode)") }
+        let d = try await fetch(s)
         guard let info = parseAccountInfo(d) else {
             throw Err("Could not read account info — wrong credentials or not an Xtream server?")
         }
         return info
     }
 
-    /// Now/next for one live channel. get_short_epg is a single small request per channel;
-    /// the alternative (xmltv.php) is a multi-megabyte dump of the entire portal.
-    static func epg(_ s: Server, streamID: String, limit: Int = 12) async throws -> [Programme] {
-        let listings = try await rows(s, "get_short_epg", "&stream_id=\(streamID)&limit=\(limit)")
-        return listings.compactMap { r in
-            guard let startSecs = string(r, "start_timestamp").flatMap(Double.init),
-                  let stopSecs = string(r, "stop_timestamp").flatMap(Double.init) else { return nil }
+    static func parseEPG(_ data: Data) -> [Programme] {
+        let decoder = JSONDecoder()
+        let rows: [EPGRow]
+        if let env = try? decoder.decode(EPGEnvelope.self, from: data), let list = env.epg_listings {
+            rows = list
+        } else if let bare = try? decoder.decode([EPGRow].self, from: data) {
+            rows = bare
+        } else {
+            return []
+        }
+        return rows.compactMap { r in
+            guard let startSecs = r.start_timestamp?.value.flatMap(Double.init),
+                  let stopSecs = r.stop_timestamp?.value.flatMap(Double.init) else { return nil }
             return Programme(
-                id: string(r, "id") ?? "\(startSecs)",
-                title: decodeEPGText(string(r, "title") ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
-                summary: decodeEPGText(string(r, "description") ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                id: r.id?.value ?? "\(startSecs)",
+                title: decodeEPGText(r.title?.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                summary: decodeEPGText(r.description?.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
                 start: Date(timeIntervalSince1970: startSecs),
                 stop: Date(timeIntervalSince1970: stopSecs))
         }
         .sorted { $0.start < $1.start }
+    }
+
+    /// Now/next for one live channel. get_short_epg is a single small request per channel;
+    /// the alternative (xmltv.php) is a multi-megabyte dump of the entire portal.
+    static func epg(_ s: Server, streamID: String, limit: Int = 12) async throws -> [Programme] {
+        let data = try await fetch(s, "get_short_epg", "&stream_id=\(streamID)&limit=\(limit)")
+        return parseEPG(data)
     }
 }
 

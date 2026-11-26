@@ -1,3 +1,4 @@
+import ImageIO
 import Sparkle
 import SwiftUI
 import UniformTypeIdentifiers
@@ -44,6 +45,9 @@ struct ContentView: View {
     @State private var playing: Channel?
     @State private var player = PlayerController()
     @State private var theaterMode = false
+    @State private var miniPlayer = false
+    @State private var miniWindow = MiniPlayerWindowController()
+    @State private var loadedSourceID: Source.ID?
     @AppStorage("defaultPlayer") private var defaultPlayer = PlaybackTarget.builtin
     /// The source in the add/edit sheet. New sources are not in `sources` until saved.
     @State private var editing: Source?
@@ -153,7 +157,11 @@ struct ContentView: View {
                             Button("Edit…") { editing = s }
                         }
                         Button("Remove", role: .destructive) {
-                            if let selected, ids.contains(selected) { player.stop() }
+                            if let selected, ids.contains(selected) {
+                                closeMiniPlayer()
+                                player.stop()
+                            }
+                            for id in ids { ChannelCache.remove(sourceID: id) }
                             sources.removeAll { ids.contains($0.id) }
                             Store.save(sources)
                         }
@@ -262,7 +270,8 @@ struct ContentView: View {
                 channel: active,
                 theaterMode: $theaterMode,
                 onOpenInVLC: { playInVLC(active) },
-                onToggleFullScreen: toggleFullScreen
+                onToggleFullScreen: toggleFullScreen,
+                onToggleMiniPlayer: toggleMiniPlayer
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea()
@@ -272,6 +281,13 @@ struct ContentView: View {
             // Deferred: setting selection inside the table's first update is reentrant.
             if selected == nil { Task { selected = sources.first?.id } }
         }
+        .onChange(of: player.activeChannel) { _, active in
+            if active == nil {
+                closeMiniPlayer()
+            } else if miniPlayer, let active {
+                miniWindow.update { miniPlayerContent(for: active) }
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { note in
             if theaterMode {
                 theaterMode = false
@@ -279,6 +295,7 @@ struct ContentView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            closeMiniPlayer()
             player.shutdown()
         }
         .task(id: loadKey) { await loadSelected() }
@@ -369,13 +386,40 @@ struct ContentView: View {
         let inspected = playing ?? player.activeChannel
         if let active = player.activeChannel {
             VStack(spacing: 0) {
-                if !theaterMode {
+                if miniPlayer {
+                    HStack(spacing: 10) {
+                        Image(systemName: "pip").foregroundStyle(.secondary)
+                        Text("Playing **\(active.name)** in Floating Mini-Player")
+                            .font(.callout)
+                            .lineLimit(1)
+                        Spacer()
+                        Button("Return to Window") { closeMiniPlayer() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        Button("Stop") {
+                            closeMiniPlayer()
+                            player.stop()
+                        }
+                        .controlSize(.small)
+                    }
+                    .padding(12)
+                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+                    .padding(12)
+
+                    if let shownChannel = inspected {
+                        ScrollView {
+                            channelDetails(shownChannel, isCurrentlyPlaying: shownChannel.id == active.id)
+                                .padding([.horizontal, .bottom])
+                        }
+                    }
+                } else if !theaterMode {
                     EmbeddedPlayerView(
                         controller: player,
                         channel: active,
                         theaterMode: $theaterMode,
                         onOpenInVLC: { playInVLC(active) },
-                        onToggleFullScreen: toggleFullScreen
+                        onToggleFullScreen: toggleFullScreen,
+                        onToggleMiniPlayer: toggleMiniPlayer
                     )
                     .frame(maxWidth: .infinity)
                     .aspectRatio(16 / 9, contentMode: .fit)
@@ -412,10 +456,7 @@ struct ContentView: View {
     private func channelDetails(_ c: Channel, isCurrentlyPlaying: Bool) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
-                AsyncImage(url: c.logo) { $0.resizable().scaledToFit() }
-                    placeholder: { Image(systemName: "tv").font(.largeTitle)
-                        .foregroundStyle(.secondary) }
-                    .frame(width: 72, height: 54)
+                LogoImage(url: c.logo, width: 72, height: 54, placeholderFont: .largeTitle)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(c.name).font(.title3).bold().textSelection(.enabled)
                     Text(c.group).font(.caption).foregroundStyle(.secondary)
@@ -481,6 +522,7 @@ struct ContentView: View {
 
     private func toggleFullScreen() {
         let entering = !theaterMode
+        if entering && miniPlayer { closeMiniPlayer() }
         let window = NSApp.keyWindow
         theaterMode = entering
         window?.toolbar?.isVisible = !entering
@@ -495,10 +537,44 @@ struct ContentView: View {
         }
     }
 
+    private func toggleMiniPlayer() {
+        if miniPlayer {
+            closeMiniPlayer()
+            return
+        }
+        guard let active = player.activeChannel else { return }
+        if theaterMode { toggleFullScreen() }
+        miniPlayer = true
+        miniWindow.show(content: { miniPlayerContent(for: active) }, onClose: {
+            miniPlayer = false
+        })
+    }
+
+    private func closeMiniPlayer() {
+        guard miniPlayer else { return }
+        miniPlayer = false
+        miniWindow.close()
+    }
+
+    @ViewBuilder
+    private func miniPlayerContent(for channel: Channel) -> some View {
+        EmbeddedPlayerView(
+            controller: player,
+            channel: channel,
+            theaterMode: .constant(false),
+            isMiniPlayer: true,
+            onOpenInVLC: { playInVLC(channel) },
+            onToggleFullScreen: toggleFullScreen,
+            onToggleMiniPlayer: toggleMiniPlayer
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
     private func playInVLC(_ c: Channel) {
         playing = c
         playError = nil
         if theaterMode { toggleFullScreen() }
+        closeMiniPlayer()
         if player.isActive { player.stop() }
         do { try VLC.play(c.url) } catch { playError = error.localizedDescription }
     }
@@ -518,34 +594,65 @@ struct ContentView: View {
     }
 
     private func loadSelected() async {
-        // Reset before the guard: removing the selected source must empty the list too.
-        theaterMode = false; player.stop()
-        error = nil; allChannels = []; index = .empty; favoriteNames = []; favoriteChannels = []
-        shown = []; group = ChannelIndex.allGroup; playing = nil; guide.clear(); accountInfo = nil; searchGeneration += 1
-        guard let source = currentSource else { return }
+        let switchedSource = loadedSourceID != selected
+        loadedSourceID = selected
+        if switchedSource {
+            if theaterMode { toggleFullScreen() }
+            closeMiniPlayer()
+            player.stop()
+            allChannels = []; index = .empty; favoriteNames = []; favoriteChannels = []
+            shown = []; group = ChannelIndex.allGroup; playing = nil; accountInfo = nil
+            searchGeneration += 1
+        }
+        error = nil
+        guide.clear()
+        guard let source = currentSource else {
+            allChannels = []; index = .empty; favoriteNames = []; favoriteChannels = []
+            shown = []; playing = nil; accountInfo = nil
+            return
+        }
         let filter = source.filter ?? SourceFilter()
+
+        // Show the last cached channel list immediately so large portals feel instant on launch,
+        // then refresh in the background.
+        var usedCache = false
+        if switchedSource,
+           let cached = await ChannelCache.load(sourceID: source.id, live: filter.live, movies: filter.movies),
+           !cached.isEmpty, !Task.isCancelled {
+            allChannels = cached
+            applyFilter()
+            usedCache = true
+        }
+
         loading = true
         defer { loading = false }
         do {
+            let fresh: [Channel]
             switch source.kind {
             case .xtream(let s):
                 async let channelsTask = Xtream.channels(s, live: filter.live, movies: filter.movies)
                 async let accountTask: AccountInfo? = try? await Xtream.accountInfo(s)
-                allChannels = try await channelsTask
+                fresh = try await channelsTask
                 accountInfo = await accountTask
             case .m3u(let path):
-                allChannels = try await loadM3U(path: path)
+                fresh = try await loadM3U(path: path)
             }
             if Task.isCancelled { return }
-            if allChannels.isEmpty {
+            allChannels = fresh
+            if !fresh.isEmpty {
+                ChannelCache.save(fresh, sourceID: source.id, live: filter.live, movies: filter.movies)
+                applyFilter()
+            } else {
+                index = .empty; shown = []; favoriteNames = []; favoriteChannels = []
                 error = filter.live || filter.movies ? "No channels found."
                     : "Live TV and Movies are both switched off. Use the filter button to turn one on."
-            } else {
-                applyFilter()
             }
         } catch {
             // A superseded load cancels its URLSession tasks; that is not a failure to report.
-            if !Task.isCancelled { self.error = error.localizedDescription }
+            if !Task.isCancelled {
+                self.error = usedCache ? "Using cached list — refresh failed: \(error.localizedDescription)"
+                    : error.localizedDescription
+            }
         }
     }
 }
@@ -768,9 +875,7 @@ struct ChannelRow: View {
     var body: some View {
         let now = guide.now(channel)
         HStack {
-            AsyncImage(url: channel.logo) { $0.resizable().scaledToFit() }
-                placeholder: { Image(systemName: "tv").foregroundStyle(.secondary) }
-                .frame(width: 32, height: 24)
+            LogoImage(url: channel.logo, width: 32, height: 24)
             VStack(alignment: .leading, spacing: 1) {
                 Text(channel.name).lineLimit(1)
                 if let now {
@@ -993,6 +1098,91 @@ struct AccountDetailsGrid: View {
         }
         .font(.caption)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Downsamples channel logos to thumbnail pixel size off the main thread and keeps a bounded
+/// in-memory cache so scrolling 30k-channel lists doesn't decode full-res PNGs on every row.
+final class LogoCache: @unchecked Sendable {
+    static let shared = LogoCache()
+
+    private let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 500
+        c.totalCostLimit = 30_000_000
+        return c
+    }()
+
+    private func key(_ url: URL, _ maxPixelSize: Int) -> NSString {
+        "\(maxPixelSize)|\(url.absoluteString)" as NSString
+    }
+
+    func cached(for url: URL, maxPixelSize: Int) -> NSImage? {
+        cache.object(forKey: key(url, maxPixelSize))
+    }
+
+    func image(for url: URL, maxPixelSize: Int) async -> NSImage? {
+        let k = key(url, maxPixelSize)
+        if let hit = cache.object(forKey: k) { return hit }
+        guard let (data, response) = try? await URLSession.shared.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode ?? 200 < 400,
+              !Task.isCancelled else { return nil }
+
+        let downsampled: (NSImage, Int)? = await Task.detached(priority: .utility) {
+            Self.downsample(data: data, maxPixelSize: maxPixelSize)
+        }.value
+        guard let (img, cost) = downsampled, !Task.isCancelled else { return nil }
+        cache.setObject(img, forKey: k, cost: cost)
+        return img
+    }
+
+    private static func downsample(data: Data, maxPixelSize: Int) -> (NSImage, Int)? {
+        let sourceOpts = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let src = CGImageSourceCreateWithData(data as CFData, sourceOpts) else { return nil }
+        let thumbOpts = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ] as CFDictionary
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts) else { return nil }
+        let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        return (img, cg.width * cg.height * 4)
+    }
+}
+
+struct LogoImage: View {
+    let url: URL?
+    let width: CGFloat
+    let height: CGFloat
+    var placeholderFont: Font = .body
+
+    @State private var image: NSImage?
+
+    private var maxPixelSize: Int { Int(max(width, height) * 2) }
+
+    var body: some View {
+        Group {
+            if let image = image ?? url.flatMap({ LogoCache.shared.cached(for: $0, maxPixelSize: maxPixelSize) }) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "tv")
+                    .font(placeholderFont)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: width, height: height)
+        .task(id: url) {
+            guard let url else { image = nil; return }
+            if let hit = LogoCache.shared.cached(for: url, maxPixelSize: maxPixelSize) {
+                image = hit
+                return
+            }
+            image = nil
+            image = await LogoCache.shared.image(for: url, maxPixelSize: maxPixelSize)
+        }
     }
 }
 

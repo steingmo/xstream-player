@@ -67,6 +67,19 @@ let unlim = Xtream.parseAccountInfo(Data(unlimitedJSON.utf8))!
 assert(unlim.expiresAt == nil && unlim.isTrial && unlim.connectionsSummary == "max 2")
 assert(Xtream.parseAccountInfo(Data("{}".utf8)) == nil)
 
+// Decodable EPG parsing (wrapped envelope + bare array, numeric & string timestamps).
+let epgJSON = #"""
+{
+  "epg_listings": [
+    {"id": 2, "title": "UHJlbWllciBMZWFndWU=", "description": "Match", "start_timestamp": "2000", "stop_timestamp": "3000"},
+    {"id": "1", "title": "Warmup", "description": "", "start_timestamp": 1000, "stop_timestamp": 2000}
+  ]
+}
+"""#
+let progs = Xtream.parseEPG(Data(epgJSON.utf8))
+assert(progs.count == 2 && progs[0].title == "Warmup" && progs[1].title == "Premier League")
+assert(progs[0].start == Date(timeIntervalSince1970: 1000) && progs[1].id == "2")
+
 // Export has to survive our own parser, or the file is no use to anyone else either.
 let roundTripped = parseM3U(exportM3U(cs), base: base)
 assert(roundTripped.count == cs.count, "\(roundTripped.count) != \(cs.count)")

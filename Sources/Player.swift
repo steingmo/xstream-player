@@ -237,6 +237,7 @@ struct MPVVideoSurface: NSViewRepresentable {
 final class PlayerController {
     private static let volumeKey = "playerVolume"
     private static let mutedKey = "playerMuted"
+    private static let reconnectDelays: [Double] = [1.5, 3.0, 5.0]
 
     private(set) var activeChannel: Channel?
     private(set) var isLoading = false
@@ -249,6 +250,9 @@ final class PlayerController {
     private(set) var audioTracks: [MediaTrack] = []
     private(set) var subtitleTracks: [MediaTrack] = []
     private(set) var errorMessage: String?
+    private(set) var reconnectAttempt = 0
+
+    static var maxReconnectAttempts: Int { reconnectDelays.count }
 
     var volume: Double {
         didSet {
@@ -277,6 +281,8 @@ final class PlayerController {
     @ObservationIgnored private var videoHeight: Int64 = 0
     @ObservationIgnored private var videoCodec: String?
     @ObservationIgnored private var lastErrorLog: String?
+    @ObservationIgnored private var sleepActivity: NSObjectProtocol?
+    @ObservationIgnored private var reconnectTask: Task<Void, Never>?
 
     init() {
         let savedVol = UserDefaults.standard.object(forKey: Self.volumeKey) as? Double ?? 80
@@ -300,6 +306,9 @@ final class PlayerController {
     }
 
     func play(_ channel: Channel) {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt = 0
         activeChannel = channel
         isLoading = true
         isBuffering = false
@@ -314,6 +323,7 @@ final class PlayerController {
         subtitleTracks = []
         errorMessage = nil
         lastErrorLog = nil
+        updateSleepAssertion()
 
         if mpv != nil {
             sendLoadFile(channel.url)
@@ -334,10 +344,16 @@ final class PlayerController {
 
     func pause() {
         guard isActive else { return }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt = 0
         setFlag("pause", true)
     }
 
     func stop() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt = 0
         activeChannel = nil
         pendingURL = nil
         isLoading = false
@@ -353,6 +369,7 @@ final class PlayerController {
         subtitleTracks = []
         errorMessage = nil
         lastErrorLog = nil
+        updateSleepAssertion()
         command("stop")
     }
 
@@ -381,6 +398,9 @@ final class PlayerController {
     }
 
     func shutdown() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        endSleepAssertion()
         // Detach the OpenGL render context on the main thread before destroying mpv.
         videoView?.detachRenderContext()
         mpvQueue.sync {
@@ -390,6 +410,56 @@ final class PlayerController {
             self.mpv = nil
         }
         videoView = nil
+    }
+
+    /// Keeps the display awake while video is actively playing; releases as soon as paused,
+    /// stopped, or errored so the Mac sleeps normally when idle.
+    private func updateSleepAssertion() {
+        if isPlaying {
+            if sleepActivity == nil {
+                sleepActivity = ProcessInfo.processInfo.beginActivity(
+                    options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled, .userInitiated],
+                    reason: "Xstream video playback"
+                )
+            }
+        } else {
+            endSleepAssertion()
+        }
+    }
+
+    private func endSleepAssertion() {
+        if let activity = sleepActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            sleepActivity = nil
+        }
+    }
+
+    private func scheduleLiveReconnect(fallbackError: String) {
+        guard let channel = activeChannel,
+              channel.streamID != nil,
+              !isPaused,
+              reconnectAttempt < Self.reconnectDelays.count else {
+            isLoading = false
+            isBuffering = false
+            reconnectAttempt = 0
+            errorMessage = fallbackError
+            updateSleepAssertion()
+            return
+        }
+
+        let delay = Self.reconnectDelays[reconnectAttempt]
+        reconnectAttempt += 1
+        isLoading = true
+        isBuffering = false
+        errorMessage = nil
+        updateSleepAssertion()
+
+        reconnectTask?.cancel()
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled, self.activeChannel?.id == channel.id else { return }
+            self.sendLoadFile(channel.url)
+        }
     }
 
     // MARK: - libmpv Setup & Commands
@@ -537,6 +607,7 @@ final class PlayerController {
                         self.isLoading = false
                         self.audioTracks = tracks.audio
                         self.subtitleTracks = tracks.subtitles
+                        self.updateSleepAssertion()
                     }
 
                 case MPV_EVENT_PLAYBACK_RESTART:
@@ -544,6 +615,9 @@ final class PlayerController {
                         guard let self, self.isActive else { return }
                         self.isLoading = false
                         self.isBuffering = false
+                        self.reconnectAttempt = 0
+                        self.errorMessage = nil
+                        self.updateSleepAssertion()
                     }
 
                 case MPV_EVENT_END_FILE:
@@ -553,20 +627,23 @@ final class PlayerController {
                             let errText = String(cString: mpv_error_string(end.error))
                             Task { @MainActor [weak self] in
                                 guard let self, self.isActive else { return }
-                                self.isLoading = false
-                                self.isBuffering = false
-                                if let detail = self.lastErrorLog, !detail.isEmpty {
-                                    self.errorMessage = "\(errText) — \(detail)"
-                                } else {
-                                    self.errorMessage = "Could not play stream (\(errText))."
-                                }
+                                let msg = (self.lastErrorLog.map { !$0.isEmpty } ?? false)
+                                    ? "\(errText) — \(self.lastErrorLog!)"
+                                    : "Could not play stream (\(errText))."
+                                self.scheduleLiveReconnect(fallbackError: msg)
                             }
                         } else if end.reason == MPV_END_FILE_REASON_EOF {
                             Task { @MainActor [weak self] in
                                 guard let self, self.isActive else { return }
-                                self.isLoading = false
-                                self.isBuffering = false
-                                self.isPaused = true
+                                if self.activeChannel?.streamID != nil {
+                                    // Live IPTV streams occasionally close cleanly on CDN hiccups.
+                                    self.scheduleLiveReconnect(fallbackError: "Live stream ended unexpectedly.")
+                                } else {
+                                    self.isLoading = false
+                                    self.isBuffering = false
+                                    self.isPaused = true
+                                    self.updateSleepAssertion()
+                                }
                             }
                         }
                     }
@@ -605,7 +682,11 @@ final class PlayerController {
         case "pause":
             guard prop.format == MPV_FORMAT_FLAG, let ptr = prop.data else { return }
             let val = ptr.assumingMemoryBound(to: CInt.self).pointee != 0
-            Task { @MainActor [weak self] in self?.isPaused = val }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isPaused = val
+                self.updateSleepAssertion()
+            }
 
         case "paused-for-cache":
             guard prop.format == MPV_FORMAT_FLAG, let ptr = prop.data else { return }
@@ -731,14 +812,84 @@ final class PlayerController {
     }
 }
 
+// MARK: - Floating Mini-Player Window
+
+/// Always-on-top 16:9 floating panel that hosts the shared MPVOpenGLView so you can pop out
+/// video while working in other apps without interrupting playback.
+@MainActor
+final class MiniPlayerWindowController: NSObject, NSWindowDelegate {
+    private var panel: NSPanel?
+    private var onClose: (() -> Void)?
+
+    func show<Content: View>(@ViewBuilder content: () -> Content, onClose: @escaping () -> Void) {
+        self.onClose = onClose
+        if let existing = panel {
+            existing.contentView = NSHostingView(rootView: content())
+            existing.orderFrontRegardless()
+            return
+        }
+
+        let initialWidth: CGFloat = 480
+        let initialHeight: CGFloat = 270
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let origin = NSPoint(
+            x: screenFrame.maxX - initialWidth - 24,
+            y: screenFrame.minY + 24
+        )
+        let panel = NSPanel(
+            contentRect: NSRect(origin: origin, size: NSSize(width: initialWidth, height: initialHeight)),
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        panel.backgroundColor = .black
+        panel.contentAspectRatio = NSSize(width: 16, height: 9)
+        panel.minSize = NSSize(width: 320, height: 180)
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+        panel.isReleasedWhenClosed = false
+        panel.setFrameAutosaveName("XstreamMiniPlayer")
+        panel.delegate = self
+        panel.contentView = NSHostingView(rootView: content())
+        panel.orderFrontRegardless()
+        self.panel = panel
+    }
+
+    func update<Content: View>(@ViewBuilder content: () -> Content) {
+        guard let panel else { return }
+        panel.contentView = NSHostingView(rootView: content())
+    }
+
+    func close() {
+        onClose = nil
+        panel?.delegate = nil
+        panel?.close()
+        panel = nil
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        let cb = onClose
+        onClose = nil
+        panel = nil
+        cb?()
+    }
+}
+
 // MARK: - Embedded Player Stage & HUD
 
 struct EmbeddedPlayerView: View {
     let controller: PlayerController
     let channel: Channel
     @Binding var theaterMode: Bool
+    var isMiniPlayer = false
     let onOpenInVLC: () -> Void
     let onToggleFullScreen: () -> Void
+    let onToggleMiniPlayer: () -> Void
 
     @State private var showControls = true
     @State private var hideTask: Task<Void, Never>?
@@ -753,10 +904,10 @@ struct EmbeddedPlayerView: View {
         ZStack {
             Color.black
             MPVVideoSurface(controller: controller) {
-                onToggleFullScreen()
+                if isMiniPlayer { onToggleMiniPlayer() } else { onToggleFullScreen() }
             }
 
-            // Center state overlay (loading, buffering, or error)
+            // Center state overlay (loading, reconnecting, buffering, or error)
             if let error = controller.errorMessage {
                 VStack(spacing: 10) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -780,7 +931,7 @@ struct EmbeddedPlayerView: View {
             } else if controller.isLoading || controller.isBuffering {
                 HStack(spacing: 10) {
                     ProgressView().controlSize(.small)
-                    Text(controller.isLoading ? "Connecting…" : "Buffering…")
+                    Text(statusText)
                         .font(.callout)
                         .foregroundStyle(.white)
                 }
@@ -818,10 +969,21 @@ struct EmbeddedPlayerView: View {
         }
     }
 
+    private var statusText: String {
+        if controller.reconnectAttempt > 0 {
+            return "Reconnecting (\(controller.reconnectAttempt)/\(PlayerController.maxReconnectAttempts))…"
+        }
+        return controller.isLoading ? "Connecting…" : "Buffering…"
+    }
+
     private var topBar: some View {
         HStack(spacing: 10) {
+            if isMiniPlayer {
+                // Leave room for the traffic-light close button in the floating panel.
+                Spacer().frame(width: 18)
+            }
             Text(channel.name)
-                .font(.headline)
+                .font(isMiniPlayer ? .subheadline : .headline)
                 .foregroundStyle(.white)
                 .lineLimit(1)
 
@@ -836,7 +998,7 @@ struct EmbeddedPlayerView: View {
                 .background(.black.opacity(0.5), in: Capsule())
             }
 
-            if let info = controller.videoInfo {
+            if !isMiniPlayer, let info = controller.videoInfo {
                 Text(info)
                     .font(.caption2)
                     .monospacedDigit()
@@ -848,27 +1010,42 @@ struct EmbeddedPlayerView: View {
 
             Spacer()
 
-            Button {
-                onOpenInVLC()
-            } label: {
-                Label("VLC", systemImage: "arrow.up.forward.app")
-                    .font(.caption)
+            if !isMiniPlayer {
+                Button {
+                    onOpenInVLC()
+                } label: {
+                    Label("VLC", systemImage: "arrow.up.forward.app")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
+                .help("Hand off this stream to VLC")
             }
-            .buttonStyle(.bordered)
-            .tint(.white)
-            .help("Hand off this stream to VLC")
 
             Button {
-                onToggleFullScreen()
+                onToggleMiniPlayer()
             } label: {
-                Image(systemName: theaterMode ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                Image(systemName: isMiniPlayer ? "pip.exit" : "pip.enter")
             }
             .buttonStyle(.plain)
             .foregroundStyle(.white)
             .padding(6)
             .background(.black.opacity(0.45), in: Circle())
-            .keyboardShortcut("f", modifiers: [.command, .shift])
-            .help(theaterMode ? "Exit Fullscreen (⇧⌘F or Esc)" : "Fullscreen (⇧⌘F or double-click video)")
+            .help(isMiniPlayer ? "Return to main window" : "Floating Mini-Player")
+
+            if !isMiniPlayer {
+                Button {
+                    onToggleFullScreen()
+                } label: {
+                    Image(systemName: theaterMode ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .padding(6)
+                .background(.black.opacity(0.45), in: Circle())
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .help(theaterMode ? "Exit Fullscreen (⇧⌘F or Esc)" : "Fullscreen (⇧⌘F or double-click video)")
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
