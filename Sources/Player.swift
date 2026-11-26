@@ -115,12 +115,10 @@ final class MPVOpenGLView: NSOpenGLView {
         needsDisplay = true
     }
 
-    override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 {
-            onDoubleClick?()
-        } else {
-            super.mouseDown(with: event)
-        }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Let SwiftUI's ZStack HUD buttons, sliders, and double-tap gesture handle all clicks;
+        // an NSOpenGLView subview would otherwise intercept clicks before .plain SwiftUI buttons.
+        nil
     }
 
     func attachRenderContext(mpv: OpaquePointer) -> CInt {
@@ -228,6 +226,10 @@ final class MPVContainerView: NSView {
         }
         view.frame = bounds
         view.needsDisplay = true
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -1056,9 +1058,14 @@ struct EmbeddedPlayerView: View {
     var body: some View {
         ZStack {
             Color.black
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    if isMiniPlayer { onToggleMiniPlayer() } else { onToggleFullScreen() }
+                }
             MPVVideoSurface(controller: controller) {
                 if isMiniPlayer { onToggleMiniPlayer() } else { onToggleFullScreen() }
             }
+            .allowsHitTesting(false)
 
             // Center state overlay (loading, reconnecting, buffering, or error)
             if let error = controller.errorMessage {

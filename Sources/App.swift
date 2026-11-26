@@ -398,6 +398,7 @@ struct ContentView: View {
             detailPane
         }
         .opacity(theaterMode ? 0 : 1)
+        .allowsHitTesting(!theaterMode)
         .toolbar(theaterMode ? .hidden : .visible, for: .windowToolbar)
 
         if theaterMode, let active = player.activeChannel {
