@@ -222,13 +222,28 @@ final class PlayerController {
         // Capture errors so stream failures show real diagnostics instead of a black box.
         mpv_request_log_messages(handle, "error")
 
+        // Disable libmpv's built-in LuaJIT scripts and user config: Xstream renders its own
+        // SwiftUI HUD, and LuaJIT's runtime JIT compilation triggers SIGKILL (CODESIGNING
+        // Invalid Page) under macOS Hardened Runtime.
+        mpv_set_option_string(handle, "config", "no")
+        mpv_set_option_string(handle, "load-scripts", "no")
+        mpv_set_option_string(handle, "load-stats-overlay", "no")
+        mpv_set_option_string(handle, "load-console", "no")
+        mpv_set_option_string(handle, "load-osd-console", "no")
+        mpv_set_option_string(handle, "load-auto-profiles", "no")
+        mpv_set_option_string(handle, "load-commands", "no")
+        mpv_set_option_string(handle, "load-context-menu", "no")
+        mpv_set_option_string(handle, "load-positioning", "no")
+        mpv_set_option_string(handle, "load-select", "no")
+        mpv_set_option_string(handle, "osc", "no")
+        mpv_set_option_string(handle, "ytdl", "no")
+
         var wid = Int64(Int(bitPattern: Unmanaged.passUnretained(layer).toOpaque()))
         mpv_set_option(handle, "wid", MPV_FORMAT_INT64, &wid)
         mpv_set_option_string(handle, "vo", "gpu-next")
         mpv_set_option_string(handle, "gpu-api", "vulkan")
         mpv_set_option_string(handle, "gpu-context", "moltenvk")
         mpv_set_option_string(handle, "hwdec", "videotoolbox")
-        mpv_set_option_string(handle, "ytdl", "no")
         mpv_set_option_string(handle, "keep-open", "no")
         mpv_set_option_string(handle, "cache", "yes")
         mpv_set_option_string(handle, "demuxer-max-bytes", "64MiB")
