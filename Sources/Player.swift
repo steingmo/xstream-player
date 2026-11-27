@@ -57,6 +57,77 @@ enum AspectMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum BufferProfile: String, CaseIterable, Identifiable {
+    case fast
+    case balanced
+    case smooth
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .fast: return "Fast"
+        case .balanced: return "Balanced"
+        case .smooth: return "Smooth"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .fast: return "Fastest zapping, minimal buffer"
+        case .balanced: return "Default balance of speed & stability"
+        case .smooth: return "Large buffer for 4K or unstable streams"
+        }
+    }
+
+    var demuxerMaxBytes: String {
+        switch self {
+        case .fast: return "16MiB"
+        case .balanced: return "64MiB"
+        case .smooth: return "256MiB"
+        }
+    }
+
+    var demuxerReadaheadSecs: String {
+        switch self {
+        case .fast: return "2"
+        case .balanced: return "20"
+        case .smooth: return "60"
+        }
+    }
+
+    var cacheSecs: String {
+        switch self {
+        case .fast: return "2"
+        case .balanced: return "15"
+        case .smooth: return "45"
+        }
+    }
+
+    var cachePauseInitial: String {
+        switch self {
+        case .fast: return "no"
+        case .balanced: return "no"
+        case .smooth: return "yes"
+        }
+    }
+
+    var cachePauseWait: String {
+        switch self {
+        case .fast: return "1"
+        case .balanced: return "1"
+        case .smooth: return "3"
+        }
+    }
+
+    var networkTimeout: String {
+        switch self {
+        case .fast: return "10"
+        case .balanced: return "15"
+        case .smooth: return "25"
+        }
+    }
+}
+
 // MARK: - OpenGL Video View (vo=libmpv)
 
 /// Renders libmpv frames via mpv_render_context into an NSOpenGLView.
@@ -271,6 +342,7 @@ struct MPVVideoSurface: NSViewRepresentable {
 final class PlayerController {
     private static let volumeKey = "playerVolume"
     private static let mutedKey = "playerMuted"
+    private static let bufferProfileKey = "playerBufferProfile"
     private static let reconnectDelays: [Double] = [1.5, 3.0, 5.0]
 
     private(set) var activeChannel: Channel?
@@ -334,6 +406,15 @@ final class PlayerController {
         }
     }
 
+    var bufferProfile: BufferProfile {
+        didSet {
+            guard bufferProfile != oldValue else { return }
+            UserDefaults.standard.set(bufferProfile.rawValue, forKey: Self.bufferProfileKey)
+            applyBufferProfile()
+            flashOSD("Buffer: \(bufferProfile.label)")
+        }
+    }
+
     var isActive: Bool { activeChannel != nil }
     var isPlaying: Bool { isActive && !isPaused && !isLoading && errorMessage == nil }
 
@@ -353,6 +434,12 @@ final class PlayerController {
         let savedVol = UserDefaults.standard.object(forKey: Self.volumeKey) as? Double ?? 80
         self.volume = min(max(savedVol, 0), 100)
         self.isMuted = UserDefaults.standard.bool(forKey: Self.mutedKey)
+        if let raw = UserDefaults.standard.string(forKey: Self.bufferProfileKey),
+           let saved = BufferProfile(rawValue: raw) {
+            self.bufferProfile = saved
+        } else {
+            self.bufferProfile = .balanced
+        }
     }
 
     func ensureVideoView() -> MPVOpenGLView {
@@ -513,6 +600,15 @@ final class PlayerController {
         }
     }
 
+    private func applyBufferProfile() {
+        setString("demuxer-max-bytes", bufferProfile.demuxerMaxBytes)
+        setString("demuxer-readahead-secs", bufferProfile.demuxerReadaheadSecs)
+        setString("cache-secs", bufferProfile.cacheSecs)
+        setString("cache-pause-initial", bufferProfile.cachePauseInitial)
+        setString("cache-pause-wait", bufferProfile.cachePauseWait)
+        setString("network-timeout", bufferProfile.networkTimeout)
+    }
+
     func shutdown() {
         reconnectTask?.cancel()
         reconnectTask = nil
@@ -613,9 +709,12 @@ final class PlayerController {
         mpv_set_option_string(handle, "hwdec", "auto-safe")
         mpv_set_option_string(handle, "keep-open", "no")
         mpv_set_option_string(handle, "cache", "yes")
-        mpv_set_option_string(handle, "demuxer-max-bytes", "64MiB")
-        mpv_set_option_string(handle, "demuxer-readahead-secs", "20")
-        mpv_set_option_string(handle, "network-timeout", "15")
+        mpv_set_option_string(handle, "demuxer-max-bytes", bufferProfile.demuxerMaxBytes)
+        mpv_set_option_string(handle, "demuxer-readahead-secs", bufferProfile.demuxerReadaheadSecs)
+        mpv_set_option_string(handle, "cache-secs", bufferProfile.cacheSecs)
+        mpv_set_option_string(handle, "cache-pause-initial", bufferProfile.cachePauseInitial)
+        mpv_set_option_string(handle, "cache-pause-wait", bufferProfile.cachePauseWait)
+        mpv_set_option_string(handle, "network-timeout", bufferProfile.networkTimeout)
         mpv_set_option_string(handle, "tls-verify", "no")
         mpv_set_option_string(handle, "user-agent", "VLC/3.0.21 LibVLC/3.0.21")
         mpv_set_option_string(handle, "subs-match-os-language", "yes")
@@ -1514,7 +1613,26 @@ struct EmbeddedPlayerView: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(width: 165)
+                .frame(width: 175)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Buffer").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { controller.bufferProfile },
+                        set: { controller.bufferProfile = $0 }
+                    )) {
+                        ForEach(BufferProfile.allCases) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(width: 175)
+                }
+                Text(controller.bufferProfile.summary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             if controller.isSeekable {
@@ -1543,7 +1661,7 @@ struct EmbeddedPlayerView: View {
             .font(.caption)
         }
         .padding(12)
-        .frame(width: 260)
+        .frame(width: 275)
     }
 
     private var volumeIcon: String {
