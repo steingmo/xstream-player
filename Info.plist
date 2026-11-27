@@ -5,8 +5,8 @@
   <key>CFBundleName</key><string>Xstream</string>
   <key>CFBundleExecutable</key><string>Xstream</string>
   <key>CFBundleIdentifier</key><string>com.steingrimosa.xstream</string>
-  <key>CFBundleVersion</key><string>21</string>
-  <key>CFBundleShortVersionString</key><string>2.4.3</string>
+  <key>CFBundleVersion</key><string>22</string>
+  <key>CFBundleShortVersionString</key><string>2.4.4</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>CFBundleIconFile</key><string>app-icon</string>

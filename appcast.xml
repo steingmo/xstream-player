@@ -3,14 +3,14 @@
   <channel>
     <title>Xstream</title>
     <item>
-      <title>Version 2.4.3</title>
-      <pubDate>Thu, 26 Nov 2026 20:29:15 +0000</pubDate>
-      <sparkle:version>21</sparkle:version>
-      <sparkle:shortVersionString>2.4.3</sparkle:shortVersionString>
+      <title>Version 2.4.4</title>
+      <pubDate>Fri, 27 Nov 2026 12:39:41 +0000</pubDate>
+      <sparkle:version>22</sparkle:version>
+      <sparkle:shortVersionString>2.4.4</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
       <enclosure
-        url="https://github.com/steingmo/xstream-player/releases/download/v2.4.3/Xstream.zip"
-        sparkle:edSignature="sHMqwbcKOuXQJ+7JRwZiX1Z4+R2ZhCtFQFPq/ItUgIfh7JXzvSXv7RxKnslDqfkn14IQsA1EdUGq4Mjxxf8tDQ==" length="35191989"
+        url="https://github.com/steingmo/xstream-player/releases/download/v2.4.4/Xstream.zip"
+        sparkle:edSignature="wX1yz56qpJvaH2klB6b9gp3OsXSJ9yPRFEu3rBANqixFR+xXQE/xJ6whZ+p8l5rEG/G/vcxuDx+N8rd41C4IAQ==" length="35192371"
         type="application/octet-stream"/>
     </item>
   </channel>
