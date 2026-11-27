@@ -752,7 +752,31 @@ struct ContentView: View {
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 12)
-            .padding(.bottom, 8)
+            .padding(.bottom, 6)
+
+            if !index.categoryGroups.isEmpty {
+                HStack(spacing: 6) {
+                    Picker("", selection: Binding(
+                        get: { index.categoryGroups.contains(group) ? group : ChannelIndex.allGroup },
+                        set: { group = $0 }
+                    )) {
+                        Text("All Categories").tag(ChannelIndex.allGroup)
+                        Divider()
+                        ForEach(index.categoryGroups, id: \.self) { Text($0).tag($0) }
+                    }
+                    .labelsHidden()
+                    .controlSize(.small)
+
+                    Text(query.trimmingCharacters(in: .whitespaces).isEmpty
+                         ? "\(shown.count)"
+                         : "\(shown.count) match\(shown.count == 1 ? "" : "es")")
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+            }
 
             TextField("Filter channels…", text: $query)
                 .textFieldStyle(.roundedBorder)
