@@ -40,7 +40,7 @@ struct XstreamApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("Xstream") { ContentView(bridge: bridge) }
+        Window("Xstream", id: "main") { ContentView(bridge: bridge) }
             .defaultSize(width: 1200, height: 720)
             .commands {
                 CommandGroup(after: .appInfo) {
@@ -112,6 +112,7 @@ struct ContentView: View {
     @State private var showFullscreenDrawer = false
     @State private var miniPlayer = false
     @State private var miniWindow = MiniPlayerWindowController()
+    @State private var hostWindow = WeakWindowBox()
     @State private var loadedSourceID: Source.ID?
     @AppStorage("defaultPlayer") private var defaultPlayer = PlaybackTarget.builtin
     /// The source in the add/edit sheet. New sources are not in `sources` until saved.
@@ -455,11 +456,28 @@ struct ContentView: View {
         .onChange(of: shown.count) { syncMenuBridge() }
         .onChange(of: loading) { syncMenuBridge() }
         .onChange(of: selected) { syncMenuBridge() }
+        .background(WindowAccessor { window in
+            if let window { hostWindow.window = window }
+        })
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { note in
             if theaterMode {
                 theaterMode = false
                 (note.object as? NSWindow)?.toolbar?.isVisible = true
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
+            guard let closed = note.object as? NSWindow, closed === hostWindow.window else { return }
+            if theaterMode {
+                theaterMode = false
+                closed.toolbar?.isVisible = true
+            }
+            showFullscreenDrawer = false
+            closeMiniPlayer()
+            player.stop()
+        }
+        .onDisappear {
+            closeMiniPlayer()
+            if player.isActive { player.stop() }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             closeMiniPlayer()
@@ -937,7 +955,7 @@ struct ContentView: View {
     private func toggleFullScreen() {
         let entering = !theaterMode
         if entering && miniPlayer { closeMiniPlayer() }
-        let window = NSApp.keyWindow
+        let window = hostWindow.window ?? NSApp.keyWindow
         theaterMode = entering
         window?.toolbar?.isVisible = !entering
         if let window {
@@ -1722,5 +1740,36 @@ struct M3UFile: FileDocument {
 
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
         FileWrapper(regularFileWithContents: Data(text.utf8))
+    }
+}
+
+/// Non-owning box for the main NSWindow so ContentView can match its own close notification
+/// without retaining the window or triggering SwiftUI view updates.
+private final class WeakWindowBox {
+    weak var window: NSWindow?
+}
+
+/// Captures the hosting NSWindow so ContentView can distinguish its own close events
+/// from sheets, alerts, or the floating mini-player panel.
+private struct WindowAccessor: NSViewRepresentable {
+    let onResolve: (NSWindow?) -> Void
+
+    final class ProbeView: NSView {
+        var onResolve: ((NSWindow?) -> Void)?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            onResolve?(window)
+        }
+    }
+
+    func makeNSView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.onResolve = onResolve
+        return view
+    }
+
+    func updateNSView(_ nsView: ProbeView, context: Context) {
+        nsView.onResolve = onResolve
+        if let window = nsView.window { onResolve(window) }
     }
 }
