@@ -606,6 +606,10 @@ final class PlayerController {
         mpv_set_option_string(handle, "ytdl", "no")
 
         mpv_set_option_string(handle, "vo", "libmpv")
+        // Use AVFoundation audio output instead of CoreAudio: libmpv's ao_coreaudio has a
+        // use-after-free on macOS HALC_ProxyNotification Call Listener Queue when audio
+        // devices change (AirPods, Bluetooth, external monitors) or tear down.
+        mpv_set_option_string(handle, "ao", "avfoundation")
         mpv_set_option_string(handle, "hwdec", "auto-safe")
         mpv_set_option_string(handle, "keep-open", "no")
         mpv_set_option_string(handle, "cache", "yes")
