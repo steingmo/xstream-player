@@ -134,7 +134,7 @@ struct Server: Codable, Hashable {
 
 struct XMLPortalServer: Codable, Hashable, Sendable {
     var baseURL = ""
-    var loginPath = "/amember/login"
+    var loginPath = ""
     var directoryPath = ""
     var username = ""
     var password = ""
@@ -1229,9 +1229,8 @@ enum XMLPortal {
 
     static func loginURL(_ server: XMLPortalServer) -> URL? {
         let base = normalizedBase(server)
-        guard !base.isEmpty else { return nil }
         var path = server.loginPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        if path.isEmpty { path = "/amember/login" }
+        guard !base.isEmpty, !path.isEmpty else { return nil }
         if !path.hasPrefix("/") { path = "/" + path }
         return URL(string: base + path)
     }

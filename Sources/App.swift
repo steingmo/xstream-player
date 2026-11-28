@@ -1474,7 +1474,7 @@ struct SourceEditor: View {
                     SecureField("Password", text: $server.password)
                 } else if isXMLPortal {
                     TextField("Base URL", text: $xmlPortal.baseURL, prompt: Text("https://portal.example.com"))
-                    TextField("Login Path", text: $xmlPortal.loginPath, prompt: Text("/amember/login"))
+                    TextField("Login Path", text: $xmlPortal.loginPath, prompt: Text("/login"))
                     TextField("XML Directory", text: $xmlPortal.directoryPath, prompt: Text("/path/to/xml/"))
                     TextField("Username", text: $xmlPortal.username)
                     SecureField("Password", text: $xmlPortal.password)
