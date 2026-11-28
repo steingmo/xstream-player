@@ -222,4 +222,39 @@ let hlsSample = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg001.ts\n"
 let seg = StreamProbe.firstSegmentURL(in: hlsSample, base: URL(string: "http://cdn.example.com/live/index.m3u8")!)
 assert(seg?.absoluteString == "http://cdn.example.com/live/seg001.ts", seg?.absoluteString ?? "nil")
 
+// Generic XML Portal directory & XML item parsing + URL signing.
+let dirHTML = """
+<a href="?C=N;O=D">Name</a>
+<a href="/xml/">Parent Directory</a>
+<a href="recycle_bin/">recycle_bin/</a>
+<a href="sports/">Sports/</a>
+<a href="live_tv.xml">live_tv.xml</a>
+"""
+let dirLinks = XMLPortal.parseDirectoryLinks(dirHTML, baseURL: URL(string: "https://portal.example.com/xml/")!)
+assert(dirLinks.count == 2)
+assert(dirLinks[0].isDirectory && dirLinks[0].name == "Sports")
+assert(!dirLinks[1].isDirectory && dirLinks[1].name == "live_tv.xml")
+
+let portalXML = """
+<items>
+  <item>
+    <title>Match 1 HD</title>
+    <link>https://edge.example.com/live/m1.m3u8</link>
+    <thumbnail>https://edge.example.com/logo.png</thumbnail>
+    <epgdata>Team A vs Team B/NL/Kickoff 20:00</epgdata>
+  </item>
+  <item>
+    <title>Match 2</title>
+    <link>https://edge.example.com/live/m2a.m3u8</link>
+    <link>https://edge.example.com/live/m2b.m3u8</link>
+  </item>
+</items>
+"""
+let xmlCh = XMLPortal.parseXMLItems(portalXML, group: "Live")
+assert(xmlCh.count == 3)
+assert(xmlCh[0].name == "Match 1 HD" && xmlCh[0].notes == "Team A vs Team B\nKickoff 20:00")
+assert(xmlCh[1].name == "1) Match 2" && xmlCh[2].name == "2) Match 2")
+let signed = XMLPortal.signedURL(xmlCh[0].url, hash: "abc123")
+assert(signed.absoluteString == "https://edge.example.com/live/m1.m3u8?wmsAuthSign=abc123")
+
 print("ok — \(cs.count) channels parsed, all checks passed")

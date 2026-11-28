@@ -204,6 +204,12 @@ struct ContentView: View {
         return server
     }
 
+    private var currentXMLPortal: XMLPortalServer? {
+        guard let kind = sources.first(where: { $0.id == selected })?.kind,
+              case .xmlPortal(let portal) = kind else { return nil }
+        return portal
+    }
+
     private var sourceName: String {
         sources.first(where: { $0.id == selected })?.name ?? "channels"
     }
@@ -283,7 +289,11 @@ struct ContentView: View {
                             ForEach(sources) { s in
                                 HStack {
                                     Label(s.name, systemImage: {
-                                        if case .xtream = s.kind { return "antenna.radiowaves.left.and.right" } else { return "doc.text" }
+                                        switch s.kind {
+                                        case .xtream: return "antenna.radiowaves.left.and.right"
+                                        case .xmlPortal: return "globe"
+                                        case .m3u: return "doc.text"
+                                        }
                                     }())
                                     Spacer()
                                     if s.id == selected && !index.channels.isEmpty {
@@ -330,6 +340,7 @@ struct ContentView: View {
                 .toolbar {
                     Menu {
                         Button("Xtream Server…") { editing = Source(name: "", kind: .xtream(Server())) }
+                        Button("XML Portal…") { editing = Source(name: "", kind: .xmlPortal(XMLPortalServer())) }
                         Button("M3U File…") { importing = true }
                     } label: { Image(systemName: "plus") }
                 }
@@ -1080,6 +1091,26 @@ struct ContentView: View {
                 Text(playError).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
 
+            if let notes = c.notes, !notes.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("SCHEDULE / INFO")
+                        .font(.caption2).bold()
+                        .foregroundStyle(.tertiary)
+                    Text(notes)
+                        .font(.callout)
+                        .foregroundStyle(.primary.opacity(0.9))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(.primary.opacity(0.06), lineWidth: 1)
+                )
+            }
+
             GuideView(
                 guide: guide,
                 channel: c,
@@ -1103,7 +1134,21 @@ struct ContentView: View {
         playing = c
         playError = nil
         recordRecent(c)
-        player.play(c)
+        if let portal = currentXMLPortal {
+            Task {
+                do {
+                    let signed = try await XMLPortal.resolvePlaybackURL(for: c, server: portal)
+                    guard playing?.id == c.id else { return }
+                    let resolvedChannel = Channel(id: c.id, name: c.name, group: c.group,
+                                                  logo: c.logo, url: signed, streamID: c.streamID, notes: c.notes)
+                    player.play(resolvedChannel)
+                } catch {
+                    playError = error.localizedDescription
+                }
+            }
+        } else {
+            player.play(c)
+        }
     }
 
     private func toggleFullScreen() {
@@ -1163,7 +1208,14 @@ struct ContentView: View {
             closeMiniPlayer()
             player.stop()
         }
-        bridge.onReloadStream = { player.reload() }
+        bridge.onReloadStream = {
+            if currentXMLPortal != nil, let active = player.activeChannel {
+                player.flashOSD("Reloading stream…")
+                playInBuiltIn(active)
+            } else {
+                player.reload()
+            }
+        }
         bridge.onToggleMute = { player.toggleMute() }
         bridge.onPreviousChannel = { zapChannel(offset: -1) }
         bridge.onNextChannel = { zapChannel(offset: 1) }
@@ -1215,7 +1267,18 @@ struct ContentView: View {
         if theaterMode { toggleFullScreen() }
         closeMiniPlayer()
         if player.isActive { player.stop() }
-        do { try VLC.play(c.url) } catch { playError = error.localizedDescription }
+        if let portal = currentXMLPortal {
+            Task {
+                do {
+                    let signed = try await XMLPortal.resolvePlaybackURL(for: c, server: portal)
+                    try VLC.play(signed)
+                } catch {
+                    playError = error.localizedDescription
+                }
+            }
+        } else {
+            do { try VLC.play(c.url) } catch { playError = error.localizedDescription }
+        }
     }
 
     private func loadEPG() async {
@@ -1240,7 +1303,15 @@ struct ContentView: View {
         probeError = nil
         probeTask = Task {
             do {
-                let result = try await StreamProbe.measure(channel: channel)
+                let targetChannel: Channel
+                if let portal = currentXMLPortal {
+                    let signed = try await XMLPortal.resolvePlaybackURL(for: channel, server: portal)
+                    targetChannel = Channel(id: channel.id, name: channel.name, group: channel.group,
+                                            logo: channel.logo, url: signed, streamID: channel.streamID, notes: channel.notes)
+                } else {
+                    targetChannel = channel
+                }
+                let result = try await StreamProbe.measure(channel: targetChannel)
                 if !Task.isCancelled {
                     probeResult = result
                     probeError = nil
@@ -1307,6 +1378,8 @@ struct ContentView: View {
                 async let accountTask: AccountInfo? = try? await Xtream.accountInfo(s)
                 fresh = try await channelsTask
                 accountInfo = await accountTask
+            case .xmlPortal(let portal):
+                fresh = try await XMLPortal.channels(portal)
             case .m3u(let path):
                 fresh = try await loadM3U(path: path)
             }
@@ -1338,8 +1411,10 @@ struct SourceEditor: View {
 
     @State private var source: Source
     @State private var server: Server
+    @State private var xmlPortal: XMLPortalServer
     @State private var filter: SourceFilter
     private let isXtream: Bool
+    private let isXMLPortal: Bool
     /// Fixed at open, so the button doesn't flip from Add to Save while typing.
     private let isNew: Bool
 
@@ -1357,10 +1432,19 @@ struct SourceEditor: View {
         self.onSave = onSave
         _source = State(initialValue: source)
         _filter = State(initialValue: source.filter ?? SourceFilter())
-        if case .xtream(let s) = source.kind {
-            _server = State(initialValue: s); isXtream = true; isNew = s.host.isEmpty
-        } else {
-            _server = State(initialValue: Server()); isXtream = false; isNew = false
+        switch source.kind {
+        case .xtream(let s):
+            _server = State(initialValue: s)
+            _xmlPortal = State(initialValue: XMLPortalServer())
+            isXtream = true; isXMLPortal = false; isNew = s.host.isEmpty
+        case .xmlPortal(let p):
+            _server = State(initialValue: Server())
+            _xmlPortal = State(initialValue: p)
+            isXtream = false; isXMLPortal = true; isNew = p.baseURL.isEmpty
+        case .m3u:
+            _server = State(initialValue: Server())
+            _xmlPortal = State(initialValue: XMLPortalServer())
+            isXtream = false; isXMLPortal = false; isNew = false
         }
     }
 
@@ -1383,11 +1467,17 @@ struct SourceEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Form {
-                TextField("Name", text: $source.name, prompt: Text(isXtream ? "My provider" : "Playlist"))
+                TextField("Name", text: $source.name, prompt: Text(isXtream ? "My provider" : (isXMLPortal ? "XML Portal" : "Playlist")))
                 if isXtream {
                     TextField("Server", text: $server.host, prompt: Text("http://host:port"))
                     TextField("Username", text: $server.username)
                     SecureField("Password", text: $server.password)
+                } else if isXMLPortal {
+                    TextField("Base URL", text: $xmlPortal.baseURL, prompt: Text("https://portal.example.com"))
+                    TextField("Login Path", text: $xmlPortal.loginPath, prompt: Text("/amember/login"))
+                    TextField("XML Directory", text: $xmlPortal.directoryPath, prompt: Text("/path/to/xml/"))
+                    TextField("Username", text: $xmlPortal.username)
+                    SecureField("Password", text: $xmlPortal.password)
                 }
             }
 
@@ -1420,7 +1510,7 @@ struct SourceEditor: View {
                             Button(loadingCategories ? "Loading…" : "Load Categories") {
                                 Task { await loadCategories() }
                             }
-                            .disabled(loadingCategories || (isXtream && server.host.isEmpty))
+                            .disabled(loadingCategories || (isXtream && server.host.isEmpty) || (isXMLPortal && xmlPortal.baseURL.isEmpty))
                             if loadingCategories { ProgressView().controlSize(.small) }
                             Spacer()
                         }
@@ -1471,7 +1561,7 @@ struct SourceEditor: View {
                     .keyboardShortcut(.cancelAction)
                 Button(isNew ? "Add" : "Save") { save() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(isXtream && server.host.isEmpty)
+                    .disabled((isXtream && server.host.isEmpty) || (isXMLPortal && xmlPortal.baseURL.isEmpty))
             }
         }
         .padding()
@@ -1479,7 +1569,9 @@ struct SourceEditor: View {
         .task {
             // An existing source can show its categories straight away; a new server
             // waits for the button, since its address is still being typed.
-            if !isXtream || !server.host.isEmpty { await loadCategories() }
+            if (!isXtream || !server.host.isEmpty) && (!isXMLPortal || !xmlPortal.baseURL.isEmpty) {
+                await loadCategories()
+            }
         }
     }
 
@@ -1506,6 +1598,8 @@ struct SourceEditor: View {
                 async let infoTask: AccountInfo? = try? await Xtream.accountInfo(server)
                 found = try await catsTask
                 accountInfo = await infoTask
+            case .xmlPortal:
+                found = try await XMLPortal.categories(xmlPortal)
             case .m3u(let path):
                 found = try await loadM3U(path: path).map(\.group)
             }
@@ -1529,6 +1623,11 @@ struct SourceEditor: View {
         if isXtream {
             source.kind = .xtream(server)
             if source.name.isEmpty { source.name = server.host }
+        } else if isXMLPortal {
+            source.kind = .xmlPortal(xmlPortal)
+            if source.name.isEmpty {
+                source.name = URL(string: XMLPortal.normalizedBase(xmlPortal))?.host ?? xmlPortal.baseURL
+            }
         }
         source.filter = filter
         onSave(source)

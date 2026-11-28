@@ -32,6 +32,8 @@ struct Channel: Identifiable, Hashable, Sendable, Codable {
     let url: URL
     /// Xtream live stream id — nil for VOD and for M3U entries, which have no EPG.
     var streamID: String? = nil
+    /// Optional schedule or description text (e.g. XML portal `<epgdata>`).
+    var notes: String? = nil
 
     var quality: ChannelQuality? { Self.parseQuality(name) }
 
@@ -130,9 +132,18 @@ struct Server: Codable, Hashable {
     var password = ""
 }
 
+struct XMLPortalServer: Codable, Hashable, Sendable {
+    var baseURL = ""
+    var loginPath = "/amember/login"
+    var directoryPath = ""
+    var username = ""
+    var password = ""
+}
+
 enum SourceKind: Codable, Hashable {
     case xtream(Server)
     case m3u(path: String)
+    case xmlPortal(XMLPortalServer)
 }
 
 struct Source: Codable, Hashable, Identifiable {
@@ -1140,5 +1151,366 @@ enum StreamProbe {
                 cont.resume(throwing: ProbeError.noData)
             }
         }
+    }
+}
+
+// MARK: - Generic Authenticated XML Portal (aMember + XML Directory + wmsAuthSign)
+
+actor XMLPortalSessionStore {
+    static let shared = XMLPortalSessionStore()
+    private var cookies: [String: String] = [:]
+
+    private func key(for server: XMLPortalServer) -> String {
+        "\(XMLPortal.normalizedBase(server))|\(server.username)"
+    }
+
+    func cookie(for server: XMLPortalServer) -> String? {
+        cookies[key(for: server)]
+    }
+
+    func setCookie(_ cookie: String, for server: XMLPortalServer) {
+        cookies[key(for: server)] = cookie
+    }
+
+    func clear(for server: XMLPortalServer) {
+        cookies.removeValue(forKey: key(for: server))
+    }
+}
+
+enum XMLPortal {
+    private static let browserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+
+    enum PortalError: LocalizedError {
+        case invalidURL
+        case loginFailed
+        case tokenFailed
+        case httpStatus(Int)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidURL: return "Invalid XML portal URL or directory path."
+            case .loginFailed: return "Login failed — check your username, password, and login path."
+            case .tokenFailed: return "Could not obtain a stream signing token from the portal."
+            case .httpStatus(let code): return "Portal returned HTTP \(code)."
+            }
+        }
+    }
+
+    /// Trust delegate for portals whose HTTPS endpoints use self-signed or incomplete chains.
+    private final class PermissiveTLSDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
+        func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+            if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+               let trust = challenge.protectionSpace.serverTrust {
+                completionHandler(.useCredential, URLCredential(trust: trust))
+            } else {
+                completionHandler(.performDefaultHandling, nil)
+            }
+        }
+    }
+
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 30
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        return URLSession(configuration: config, delegate: PermissiveTLSDelegate(), delegateQueue: nil)
+    }()
+
+    static func normalizedBase(_ server: XMLPortalServer) -> String {
+        var b = server.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while b.hasSuffix("/") { b.removeLast() }
+        if !b.isEmpty && !b.hasPrefix("http://") && !b.hasPrefix("https://") {
+            b = "https://" + b
+        }
+        return b
+    }
+
+    static func loginURL(_ server: XMLPortalServer) -> URL? {
+        let base = normalizedBase(server)
+        guard !base.isEmpty else { return nil }
+        var path = server.loginPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty { path = "/amember/login" }
+        if !path.hasPrefix("/") { path = "/" + path }
+        return URL(string: base + path)
+    }
+
+    static func directoryURL(_ server: XMLPortalServer) -> URL? {
+        let base = normalizedBase(server)
+        guard !base.isEmpty else { return nil }
+        var path = server.directoryPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty { path = "/" }
+        if !path.hasPrefix("/") { path = "/" + path }
+        if !path.hasSuffix("/") { path += "/" }
+        return URL(string: base + path)
+    }
+
+    private static func formEncode(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._*")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed)?.replacingOccurrences(of: "%20", with: "+") ?? value
+    }
+
+    private static func request(_ url: URL,
+                                method: String = "GET",
+                                body: Data? = nil,
+                                cookie: String? = nil,
+                                referer: URL? = nil) async throws -> (Data, HTTPURLResponse) {
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        req.httpMethod = method
+        req.httpBody = body
+        req.setValue(browserUA, forHTTPHeaderField: "User-Agent")
+        req.setValue("*/*", forHTTPHeaderField: "Accept")
+        req.setValue("en-GB,en;q=0.5", forHTTPHeaderField: "Accept-Language")
+        if let referer {
+            req.setValue(referer.absoluteString, forHTTPHeaderField: "Referer")
+        }
+        if method == "POST" {
+            req.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+            req.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+        }
+        if let cookie, !cookie.isEmpty {
+            req.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
+        let (data, resp) = try await session.data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw PortalError.invalidURL }
+        guard (200...399).contains(http.statusCode) else { throw PortalError.httpStatus(http.statusCode) }
+        return (data, http)
+    }
+
+    static func login(_ server: XMLPortalServer) async throws -> String {
+        guard let url = loginURL(server) else { throw PortalError.invalidURL }
+        let form = "amember_login=\(formEncode(server.username))&amember_pass=\(formEncode(server.password))"
+        let (data, http) = try await request(url, method: "POST", body: Data(form.utf8), referer: url)
+
+        let bodyText = String(decoding: data, as: UTF8.self)
+        let headerFields = http.allHeaderFields.reduce(into: [String: String]()) { acc, kv in
+            if let k = kv.key as? String, let v = kv.value as? String { acc[k] = v }
+        }
+        let cookies = HTTPCookie.cookies(withResponseHeaderFields: headerFields, for: url)
+        let cookieHeader = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+
+        let okInBody = bodyText.range(of: #""ok"\s*:\s*true"#, options: .regularExpression) != nil
+        guard okInBody || !cookieHeader.isEmpty else { throw PortalError.loginFailed }
+        guard !cookieHeader.isEmpty else { throw PortalError.loginFailed }
+
+        await XMLPortalSessionStore.shared.setCookie(cookieHeader, for: server)
+        return cookieHeader
+    }
+
+    static func fetchHash(_ server: XMLPortalServer, cookie: String) async throws -> String {
+        guard let dirURL = directoryURL(server),
+              var comps = URLComponents(url: dirURL, resolvingAgainstBaseURL: false) else {
+            throw PortalError.invalidURL
+        }
+        comps.queryItems = [URLQueryItem(name: "hash", value: "on")]
+        guard let hashURL = comps.url else { throw PortalError.invalidURL }
+
+        let (data, _) = try await request(hashURL, cookie: cookie, referer: loginURL(server))
+        let raw = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, !raw.localizedCaseInsensitiveContains("Please login") else {
+            throw PortalError.tokenFailed
+        }
+        var padded = raw
+        while padded.count % 4 != 0 { padded.append("=") }
+        if let decoded = Data(base64Encoded: padded),
+           let decodedStr = String(data: decoded, encoding: .utf8),
+           decodedStr.hasPrefix("server_time=") {
+            return raw
+        }
+        throw PortalError.tokenFailed
+    }
+
+    /// Ensures a valid session cookie and returns `(cookie, wmsAuthSignHash)`.
+    static func authenticate(_ server: XMLPortalServer) async throws -> (cookie: String, hash: String) {
+        if let cached = await XMLPortalSessionStore.shared.cookie(for: server),
+           let hash = try? await fetchHash(server, cookie: cached) {
+            return (cached, hash)
+        }
+        let freshCookie = try await login(server)
+        let hash = try await fetchHash(server, cookie: freshCookie)
+        return (freshCookie, hash)
+    }
+
+    static func signedURL(_ url: URL, hash: String) -> URL {
+        let sep = url.query == nil ? "?" : "&"
+        return URL(string: "\(url.absoluteString)\(sep)wmsAuthSign=\(hash)") ?? url
+    }
+
+    /// Resolves a fresh signed playback URL right before starting playback.
+    static func resolvePlaybackURL(for channel: Channel, server: XMLPortalServer) async throws -> URL {
+        let (_, hash) = try await authenticate(server)
+        return signedURL(channel.url, hash: hash)
+    }
+
+    /// Crawls the portal's XML directory and returns all discovered channels grouped by XML file.
+    static func channels(_ server: XMLPortalServer) async throws -> [Channel] {
+        guard let rootURL = directoryURL(server) else { throw PortalError.invalidURL }
+        let (cookie, _) = try await authenticate(server)
+        var visited = Set<URL>()
+        var xmlFiles: [(group: String, url: URL)] = []
+        try await crawlDirectory(rootURL, prefix: "", cookie: cookie, referer: loginURL(server),
+                                 depth: 0, visited: &visited, xmlFiles: &xmlFiles)
+
+        var all: [Channel] = []
+        for entry in xmlFiles {
+            if Task.isCancelled { return [] }
+            if let (data, _) = try? await request(entry.url, cookie: cookie, referer: loginURL(server)) {
+                let text = String(decoding: data, as: UTF8.self)
+                all.append(contentsOf: parseXMLItems(text, group: entry.group))
+            }
+        }
+        return all
+    }
+
+    static func categories(_ server: XMLPortalServer) async throws -> [String] {
+        try await channels(server).map(\.group)
+    }
+
+    private static func crawlDirectory(_ url: URL,
+                                       prefix: String,
+                                       cookie: String,
+                                       referer: URL?,
+                                       depth: Int,
+                                       visited: inout Set<URL>,
+                                       xmlFiles: inout [(group: String, url: URL)]) async throws {
+        guard depth <= 3, visited.insert(url).inserted else { return }
+        let (data, _) = try await request(url, cookie: cookie, referer: referer)
+        let html = String(decoding: data, as: UTF8.self)
+        let links = parseDirectoryLinks(html, baseURL: url)
+        for link in links {
+            if link.isDirectory {
+                let subPrefix = prefix.isEmpty ? link.name : "\(prefix) · \(link.name)"
+                try await crawlDirectory(link.url, prefix: subPrefix, cookie: cookie, referer: referer,
+                                         depth: depth + 1, visited: &visited, xmlFiles: &xmlFiles)
+            } else {
+                let cleanName = link.name.replacingOccurrences(of: ".xml", with: "", options: .caseInsensitive)
+                let group = prefix.isEmpty ? cleanName : "\(prefix) · \(cleanName)"
+                xmlFiles.append((group: group, url: link.url))
+            }
+        }
+    }
+
+    struct DirectoryLink: Equatable {
+        let name: String
+        let url: URL
+        let isDirectory: Bool
+    }
+
+    static func parseDirectoryLinks(_ html: String, baseURL: URL) -> [DirectoryLink] {
+        let pattern = #"<a\s+[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+            return []
+        }
+        let ns = html as NSString
+        let matches = regex.matches(in: html, range: NSRange(location: 0, length: ns.length))
+        var results: [DirectoryLink] = []
+        for m in matches {
+            let href = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawLabel = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if href.isEmpty || href.hasPrefix("?") || href.hasPrefix("#") || href == "../" || href == "/" { continue }
+            let lowerLabel = rawLabel.lowercased()
+            if lowerLabel == "parent directory" || href.lowercased().contains("recycle_bin") { continue }
+            guard let resolved = URL(string: href, relativeTo: baseURL)?.absoluteURL,
+                  resolved.host == baseURL.host else { continue }
+            let cleanLabel = rawLabel
+                .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+            let label = cleanLabel.isEmpty ? resolved.lastPathComponent : cleanLabel
+            if href.hasSuffix("/") {
+                results.append(DirectoryLink(name: label, url: resolved, isDirectory: true))
+            } else if href.lowercased().hasSuffix(".xml") {
+                results.append(DirectoryLink(name: label, url: resolved, isDirectory: false))
+            }
+        }
+        return results
+    }
+
+    static func parseXMLItems(_ xml: String, group: String) -> [Channel] {
+        let itemPattern = #"<item\b[^>]*>(.*?)</item>"#
+        guard let itemRegex = try? NSRegularExpression(pattern: itemPattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+            return []
+        }
+        let ns = xml as NSString
+        let matches = itemRegex.matches(in: xml, range: NSRange(location: 0, length: ns.length))
+        var channels: [Channel] = []
+        for (idx, m) in matches.enumerated() {
+            let body = ns.substring(with: m.range(at: 1))
+            let title = decodeXMLEntities(firstTag("title", in: body) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayTitle = title.isEmpty ? "Stream \(idx + 1)" : title
+
+            var links = allTags("link", in: body)
+                .map { decodeXMLEntities($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            if links.isEmpty {
+                // Fallback for bare .m3u8 lines inside <item>
+                for line in body.components(separatedBy: .newlines) {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.lowercased().hasSuffix(".m3u8"), trimmed.hasPrefix("http") {
+                        links.append(trimmed)
+                    }
+                }
+            }
+            guard !links.isEmpty else { continue }
+
+            let thumbStr = firstTag("thumbnail", in: body)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let logo = thumbStr.isEmpty ? nil : URL(string: thumbStr)
+            let rawEpg = firstTag("epgdata", in: body).map(decodeXMLEntities)?
+                .replacingOccurrences(of: "/NL/", with: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let notes = (rawEpg?.isEmpty ?? true) ? nil : rawEpg
+
+            if links.count > 1 {
+                for (altIdx, linkStr) in links.enumerated() {
+                    guard let url = URL(string: linkStr) else { continue }
+                    let name = "\(altIdx + 1)) \(displayTitle)"
+                    channels.append(Channel(
+                        id: "xml-\(group)-\(idx)-\(altIdx)-\(linkStr.hashValue)",
+                        name: name,
+                        group: group,
+                        logo: logo,
+                        url: url,
+                        streamID: nil,
+                        notes: notes
+                    ))
+                }
+            } else if let url = URL(string: links[0]) {
+                channels.append(Channel(
+                    id: "xml-\(group)-\(idx)-\(links[0].hashValue)",
+                    name: displayTitle,
+                    group: group,
+                    logo: logo,
+                    url: url,
+                    streamID: nil,
+                    notes: notes
+                ))
+            }
+        }
+        return channels
+    }
+
+    private static func firstTag(_ tag: String, in text: String) -> String? {
+        allTags(tag, in: text).first
+    }
+
+    private static func allTags(_ tag: String, in text: String) -> [String] {
+        let pattern = "<\(tag)\\b[^>]*>(.*?)</\(tag)>"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+            return []
+        }
+        let ns = text as NSString
+        return regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).map {
+            ns.substring(with: $0.range(at: 1))
+        }
+    }
+
+    private static func decodeXMLEntities(_ s: String) -> String {
+        s.replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&apos;", with: "'")
     }
 }
