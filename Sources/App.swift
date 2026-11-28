@@ -13,6 +13,7 @@ final class PlaybackMenuBridge {
     var isMiniPlayer = false
     var canZap = false
     var canRefresh = false
+    var canQuickSwitch = false
 
     var onTogglePlayPause: (() -> Void)?
     var onStop: (() -> Void)?
@@ -23,6 +24,7 @@ final class PlaybackMenuBridge {
     var onToggleFullScreen: (() -> Void)?
     var onToggleMiniPlayer: (() -> Void)?
     var onToggleDrawer: (() -> Void)?
+    var onQuickSwitch: (() -> Void)?
     var onRefresh: (() -> Void)?
 }
 
@@ -81,6 +83,9 @@ struct XstreamApp: App {
                     Button("Channel Drawer") { bridge.onToggleDrawer?() }
                         .keyboardShortcut("l", modifiers: .command)
                         .disabled(!bridge.isTheaterMode)
+                    Button("Quick Channel Switcher…") { bridge.onQuickSwitch?() }
+                        .keyboardShortcut("k", modifiers: .command)
+                        .disabled(!bridge.canQuickSwitch)
                     Divider()
                     Button("Refresh Source") { bridge.onRefresh?() }
                         .keyboardShortcut("r", modifiers: .command)
@@ -115,6 +120,7 @@ struct ContentView: View {
     @State private var player = PlayerController()
     @State private var theaterMode = false
     @State private var showFullscreenDrawer = false
+    @State private var showQuickSwitcher = false
     @State private var miniPlayer = false
     @State private var miniWindow = MiniPlayerWindowController()
     @State private var hostWindow = WeakWindowBox()
@@ -437,6 +443,27 @@ struct ContentView: View {
                 }
             }
         }
+
+        if showQuickSwitcher {
+            QuickChannelSwitcher(
+                channels: index.channels,
+                recents: recentChannels,
+                favorites: favoriteChannels,
+                favoriteNames: favoriteNames,
+                activeChannelID: player.activeChannel?.id,
+                guide: guide,
+                onSelect: { channel in
+                    withAnimation(.easeOut(duration: 0.12)) { showQuickSwitcher = false }
+                    playInBuiltIn(channel)
+                    player.flashOSD(channel.name)
+                },
+                onDismiss: {
+                    withAnimation(.easeOut(duration: 0.12)) { showQuickSwitcher = false }
+                }
+            )
+            .transition(.opacity)
+            .zIndex(20)
+        }
         }
         .onAppear {
             // Deferred: setting selection inside the table's first update is reentrant.
@@ -479,6 +506,7 @@ struct ContentView: View {
                 closed.toolbar?.isVisible = true
             }
             showFullscreenDrawer = false
+            showQuickSwitcher = false
             closeMiniPlayer()
             player.stop()
         }
@@ -1085,6 +1113,10 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.2)) { showFullscreenDrawer.toggle() }
             }
         }
+        bridge.onQuickSwitch = {
+            guard !index.channels.isEmpty else { return }
+            withAnimation(.easeOut(duration: 0.14)) { showQuickSwitcher.toggle() }
+        }
         bridge.onRefresh = { refreshGeneration += 1 }
     }
 
@@ -1096,6 +1128,7 @@ struct ContentView: View {
         bridge.isMiniPlayer = miniPlayer
         bridge.canZap = player.isActive && shown.count > 1
         bridge.canRefresh = currentSource != nil && !loading
+        bridge.canQuickSwitch = !index.channels.isEmpty
     }
 
     @ViewBuilder
@@ -1866,5 +1899,294 @@ private struct WindowAccessor: NSViewRepresentable {
     func updateNSView(_ nsView: ProbeView, context: Context) {
         nsView.onResolve = onResolve
         if let window = nsView.window { onResolve(window) }
+    }
+}
+
+/// Spotlight-style floating channel switcher (⌘K) that searches across all categories
+/// in both windowed mode and fullscreen.
+struct QuickChannelSwitcher: View {
+    let channels: [Channel]
+    let recents: [Channel]
+    let favorites: [Channel]
+    let favoriteNames: Set<String>
+    let activeChannelID: Channel.ID?
+    let guide: Guide
+    let onSelect: (Channel) -> Void
+    let onDismiss: () -> Void
+
+    @State private var query = ""
+    @State private var results: [Channel] = []
+    @State private var highlightedIndex = 0
+    @FocusState private var searchFocused: Bool
+
+    private static let maxResults = 40
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color.black.opacity(0.45)
+                .ignoresSafeArea()
+                .onTapGesture { onDismiss() }
+
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.title3)
+                        .foregroundStyle(.white.opacity(0.65))
+                    TextField("Jump to channel…", text: $query)
+                        .textFieldStyle(.plain)
+                        .font(.title3)
+                        .foregroundStyle(.white)
+                        .focused($searchFocused)
+                        .onSubmit { selectHighlighted() }
+                    if !query.isEmpty {
+                        Button {
+                            query = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.white.opacity(0.55))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Text("⌘K")
+                        .font(.caption2).fontWeight(.medium)
+                        .foregroundStyle(.white.opacity(0.5))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 13)
+
+                Divider().overlay(.white.opacity(0.12))
+
+                if results.isEmpty {
+                    VStack(spacing: 6) {
+                        Image(systemName: "tv.slash")
+                            .font(.title2)
+                            .foregroundStyle(.white.opacity(0.4))
+                        Text("No matching channels")
+                            .font(.callout)
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 32)
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 2) {
+                                ForEach(Array(results.enumerated()), id: \.element.id) { idx, c in
+                                    let isSelected = idx == highlightedIndex
+                                    let isCurrent = c.id == activeChannelID
+                                    let isFav = favoriteNames.contains(c.name)
+                                    Button {
+                                        onSelect(c)
+                                    } label: {
+                                        HStack(spacing: 10) {
+                                            LogoImage(url: c.logo, width: 32, height: 22)
+                                                .padding(3)
+                                                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                HStack(spacing: 5) {
+                                                    Text(c.name)
+                                                        .font(.callout)
+                                                        .fontWeight(isSelected || isCurrent ? .semibold : .regular)
+                                                        .foregroundStyle(.white)
+                                                        .lineLimit(1)
+                                                    if let q = c.quality {
+                                                        QualityBadge(quality: q)
+                                                    }
+                                                }
+                                                HStack(spacing: 5) {
+                                                    Text(c.group)
+                                                        .font(.caption2)
+                                                        .foregroundStyle(.white.opacity(0.55))
+                                                        .lineLimit(1)
+                                                    if let now = guide.now(c) {
+                                                        Text("· \(now.title)")
+                                                            .font(.caption2)
+                                                            .foregroundStyle(.white.opacity(0.7))
+                                                            .lineLimit(1)
+                                                    }
+                                                }
+                                            }
+                                            Spacer(minLength: 4)
+                                            if isCurrent {
+                                                Image(systemName: "speaker.wave.2.fill")
+                                                    .font(.caption)
+                                                    .foregroundStyle(Color.accentColor)
+                                            }
+                                            if isFav {
+                                                Image(systemName: "star.fill")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.yellow)
+                                            }
+                                            if isSelected {
+                                                Image(systemName: "return")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.white.opacity(0.65))
+                                            }
+                                        }
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 7)
+                                        .background(
+                                            isSelected ? Color.accentColor.opacity(0.32) : Color.clear,
+                                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        )
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .id(c.id)
+                                    .onHover { over in
+                                        if over { highlightedIndex = idx }
+                                    }
+                                }
+                            }
+                            .padding(8)
+                        }
+                        .frame(maxHeight: 360)
+                        .onChange(of: highlightedIndex) { _, idx in
+                            guard results.indices.contains(idx) else { return }
+                            proxy.scrollTo(results[idx].id, anchor: .center)
+                        }
+                    }
+                }
+
+                Divider().overlay(.white.opacity(0.12))
+
+                HStack {
+                    Text(query.trimmingCharacters(in: .whitespaces).isEmpty
+                         ? (recents.isEmpty && favorites.isEmpty ? "All Channels" : "Recent & Favorites")
+                         : "\(results.count)\(results.count == Self.maxResults ? "+" : "") matches")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.55))
+                    Spacer()
+                    Text("↑↓ Navigate  ·  ↩ Play  ·  ⎋ Close")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+            }
+            .frame(width: 520)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .environment(\.colorScheme, .dark)
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(.white.opacity(0.16), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.55), radius: 28, y: 12)
+            .padding(.top, 84)
+        }
+        .onAppear {
+            searchFocused = true
+            results = defaultResults()
+            highlightedIndex = 0
+        }
+        .task(id: query) {
+            await runSearch()
+        }
+        .onKeyPress(.downArrow) {
+            guard !results.isEmpty else { return .ignored }
+            highlightedIndex = (highlightedIndex + 1) % results.count
+            return .handled
+        }
+        .onKeyPress(.upArrow) {
+            guard !results.isEmpty else { return .ignored }
+            highlightedIndex = (highlightedIndex - 1 + results.count) % results.count
+            return .handled
+        }
+        .onKeyPress(.escape) {
+            onDismiss()
+            return .handled
+        }
+    }
+
+    private func selectHighlighted() {
+        guard results.indices.contains(highlightedIndex) else { return }
+        onSelect(results[highlightedIndex])
+    }
+
+    private func defaultResults() -> [Channel] {
+        var seen = Set<Channel.ID>()
+        var combined: [Channel] = []
+        for c in recents where seen.insert(c.id).inserted {
+            combined.append(c)
+            if combined.count >= Self.maxResults { return combined }
+        }
+        for c in favorites where seen.insert(c.id).inserted {
+            combined.append(c)
+            if combined.count >= Self.maxResults { return combined }
+        }
+        if combined.isEmpty {
+            return Array(channels.prefix(Self.maxResults))
+        }
+        return combined
+    }
+
+    private func runSearch() async {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else {
+            results = defaultResults()
+            highlightedIndex = 0
+            return
+        }
+        let all = channels
+        let favs = favoriteNames
+        let limit = Self.maxResults
+        if all.count > 2_000 {
+            try? await Task.sleep(for: .milliseconds(50))
+            if Task.isCancelled { return }
+        }
+        let task = Task.detached(priority: .userInitiated) {
+            Self.rankMatches(in: all, query: trimmed, favoriteNames: favs, limit: limit)
+        }
+        let found = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        guard !Task.isCancelled else { return }
+        results = found
+        highlightedIndex = 0
+    }
+
+    private nonisolated static func rankMatches(in channels: [Channel],
+                                              query: String,
+                                              favoriteNames: Set<String>,
+                                              limit: Int) -> [Channel] {
+        let tokens = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !tokens.isEmpty else { return [] }
+        let firstToken = tokens[0]
+        var prefixFav: [Channel] = []
+        var prefixOther: [Channel] = []
+        var nameFav: [Channel] = []
+        var nameOther: [Channel] = []
+        var groupOnly: [Channel] = []
+
+        for c in channels {
+            if Task.isCancelled { return [] }
+            let matchesAll = tokens.allSatisfy { tok in
+                c.name.localizedCaseInsensitiveContains(tok) || c.group.localizedCaseInsensitiveContains(tok)
+            }
+            guard matchesAll else { continue }
+            let isFav = favoriteNames.contains(c.name)
+            if c.name.range(of: firstToken, options: [.caseInsensitive, .anchored]) != nil {
+                if isFav { prefixFav.append(c) } else { prefixOther.append(c) }
+            } else if c.name.localizedCaseInsensitiveContains(firstToken) {
+                if isFav { nameFav.append(c) } else { nameOther.append(c) }
+            } else {
+                groupOnly.append(c)
+            }
+        }
+
+        var out: [Channel] = []
+        out.reserveCapacity(limit)
+        for bucket in [prefixFav, prefixOther, nameFav, nameOther, groupOnly] {
+            for c in bucket {
+                out.append(c)
+                if out.count >= limit { return out }
+            }
+        }
+        return out
     }
 }
