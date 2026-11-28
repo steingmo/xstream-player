@@ -211,4 +211,15 @@ assert(ChannelQuality.uhd4K.isHighDefinition && ChannelQuality.raw.isHighDefinit
 assert(ChannelQuality.fhd.isHighDefinition && ChannelQuality.hd.isHighDefinition)
 assert(!ChannelQuality.sd.isHighDefinition)
 
+// StreamProbe quality classification & HLS segment resolution.
+let goodProbe = StreamProbeResult(channelName: "DR1", resolvedHost: "edge.tv", ttfbMs: 40, pingMs: 35, jitterMs: 5, throughputMbps: 18.5, sampledBytes: 4_000_000, testedAt: Date())
+let fairProbe = StreamProbeResult(channelName: "DR1", resolvedHost: "edge.tv", ttfbMs: 210, pingMs: 200, jitterMs: 20, throughputMbps: 6.2, sampledBytes: 1_500_000, testedAt: Date())
+let poorProbe = StreamProbeResult(channelName: "DR1", resolvedHost: "edge.tv", ttfbMs: 450, pingMs: 420, jitterMs: 80, throughputMbps: 1.8, sampledBytes: 400_000, testedAt: Date())
+assert(goodProbe.quality == .good)
+assert(fairProbe.quality == .fair)
+assert(poorProbe.quality == .poor)
+let hlsSample = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg001.ts\n"
+let seg = StreamProbe.firstSegmentURL(in: hlsSample, base: URL(string: "http://cdn.example.com/live/index.m3u8")!)
+assert(seg?.absoluteString == "http://cdn.example.com/live/seg001.ts", seg?.absoluteString ?? "nil")
+
 print("ok — \(cs.count) channels parsed, all checks passed")

@@ -843,3 +843,302 @@ final class Guide {
         }
     }
 }
+
+// MARK: - Stream Throughput & Latency Probe
+
+struct StreamProbeResult: Equatable, Sendable {
+    enum Quality: String, Sendable {
+        case good = "Good"
+        case fair = "Fair"
+        case poor = "Poor"
+    }
+
+    let channelName: String
+    let resolvedHost: String
+    let ttfbMs: Int
+    let pingMs: Int
+    let jitterMs: Int
+    let throughputMbps: Double
+    let sampledBytes: Int
+    let testedAt: Date
+
+    var quality: Quality {
+        if pingMs <= 120 && throughputMbps >= 10 { return .good }
+        if pingMs <= 300 && throughputMbps >= 4 { return .fair }
+        return .poor
+    }
+}
+
+enum StreamProbe {
+    private static let userAgent = "VLC/3.0.21 LibVLC/3.0.21"
+    private static let maxSampleSeconds: TimeInterval = 2.0
+    private static let maxSampleBytes = 6 * 1024 * 1024
+
+    enum ProbeError: LocalizedError {
+        case httpStatus(Int)
+        case noData
+        var errorDescription: String? {
+            switch self {
+            case .httpStatus(let code): return "Stream server returned HTTP \(code)."
+            case .noData: return "Stream server returned no data."
+            }
+        }
+    }
+
+    /// Follows redirects on `channel.url` to the actual stream edge server, measures
+    /// TTFB + ~2s download throughput (handles both live MPEG-TS and HLS .m3u8), and
+    /// runs 2 lightweight follow-up pings to the resolved stream host for latency & jitter.
+    static func measure(channel: Channel) async throws -> StreamProbeResult {
+        var sample = try await sampleStream(url: channel.url)
+
+        // If the channel URL returned an HLS playlist rather than raw TS video, resolve the
+        // first media segment (following a master playlist one level if needed) and sample it.
+        if let playlistText = sample.playlistText {
+            if let firstURL = firstSegmentURL(in: playlistText, base: sample.finalURL) {
+                let nextSample = try await sampleStream(url: firstURL)
+                if let subText = nextSample.playlistText,
+                   let segURL = firstSegmentURL(in: subText, base: nextSample.finalURL) {
+                    sample = try await sampleStream(url: segURL)
+                } else {
+                    sample = nextSample
+                }
+            }
+        }
+
+        let resolvedHost = sample.finalURL.host ?? channel.url.host ?? "unknown"
+        let ttfbMs = max(1, Int((sample.ttfb * 1000).rounded()))
+
+        // 2 quick HEAD pings to the resolved stream edge origin for latency & jitter.
+        var pings: [Int] = [ttfbMs]
+        if let originURL = originURL(from: sample.finalURL) {
+            for _ in 0..<2 {
+                if let ms = await pingOrigin(originURL) {
+                    pings.append(ms)
+                }
+            }
+        }
+        let sortedPings = pings.sorted()
+        let medianPing = sortedPings[sortedPings.count / 2]
+        let jitter = (sortedPings.last ?? medianPing) - (sortedPings.first ?? medianPing)
+
+        let transferSecs = max(sample.transferDuration, 0.05)
+        let mbps = (Double(sample.bytesRead) * 8.0) / (transferSecs * 1_000_000.0)
+
+        return StreamProbeResult(
+            channelName: channel.name,
+            resolvedHost: resolvedHost,
+            ttfbMs: ttfbMs,
+            pingMs: medianPing,
+            jitterMs: jitter,
+            throughputMbps: mbps,
+            sampledBytes: sample.bytesRead,
+            testedAt: Date()
+        )
+    }
+
+    static func firstSegmentURL(in playlist: String, base: URL) -> URL? {
+        for raw in playlist.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            if let resolved = URL(string: line, relativeTo: base)?.absoluteURL {
+                return resolved
+            }
+        }
+        return nil
+    }
+
+    private static func originURL(from url: URL) -> URL? {
+        var comps = URLComponents()
+        comps.scheme = url.scheme ?? "http"
+        comps.host = url.host
+        comps.port = url.port
+        comps.path = "/"
+        return comps.url
+    }
+
+    private static func pingOrigin(_ url: URL) async -> Int? {
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+        req.httpMethod = "HEAD"
+        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        let start = CFAbsoluteTimeGetCurrent()
+        do {
+            _ = try await URLSession.shared.data(for: req)
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            return max(1, Int((elapsed * 1000).rounded()))
+        } catch {
+            return nil
+        }
+    }
+
+    private struct Sample {
+        let finalURL: URL
+        let ttfb: TimeInterval
+        let transferDuration: TimeInterval
+        let bytesRead: Int
+        let playlistText: String?
+    }
+
+    private static func sampleStream(url: URL) async throws -> Sample {
+        let delegate = StreamSampleDelegate(maxSeconds: maxSampleSeconds, maxBytes: maxSampleBytes)
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 12
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                delegate.start(session: session, request: req, continuation: cont)
+            }
+        } onCancel: {
+            delegate.cancel()
+        }
+    }
+
+    private final class StreamSampleDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+        private let maxSeconds: TimeInterval
+        private let maxBytes: Int
+        private let lock = NSLock()
+        private var session: URLSession?
+        private var task: URLSessionDataTask?
+        private var continuation: CheckedContinuation<Sample, Error>?
+        private var requestStart: CFAbsoluteTime = 0
+        private var firstByteTime: CFAbsoluteTime = 0
+        private var finalURL: URL?
+        private var isPlaylist = false
+        private var playlistBuffer = Data()
+        private var bytesRead = 0
+        private var finished = false
+
+        init(maxSeconds: TimeInterval, maxBytes: Int) {
+            self.maxSeconds = maxSeconds
+            self.maxBytes = maxBytes
+        }
+
+        func start(session: URLSession, request: URLRequest, continuation: CheckedContinuation<Sample, Error>) {
+            lock.lock()
+            self.session = session
+            self.continuation = continuation
+            self.finalURL = request.url
+            self.requestStart = CFAbsoluteTimeGetCurrent()
+            let t = session.dataTask(with: request)
+            self.task = t
+            lock.unlock()
+            t.resume()
+        }
+
+        func cancel() {
+            lock.lock()
+            let t = task
+            let s = session
+            let cont = finishLocked()
+            lock.unlock()
+            t?.cancel()
+            s?.invalidateAndCancel()
+            cont?.resume(throwing: CancellationError())
+        }
+
+        private func finishLocked() -> CheckedContinuation<Sample, Error>? {
+            guard !finished else { return nil }
+            finished = true
+            let cont = continuation
+            continuation = nil
+            return cont
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            let now = CFAbsoluteTimeGetCurrent()
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                lock.lock()
+                let cont = finishLocked()
+                let s = self.session
+                lock.unlock()
+                completionHandler(.cancel)
+                s?.invalidateAndCancel()
+                cont?.resume(throwing: ProbeError.httpStatus(http.statusCode))
+                return
+            }
+            let mime = (response.mimeType ?? "").lowercased()
+            let url = response.url ?? dataTask.originalRequest?.url
+            let looksPlaylist = mime.contains("mpegurl") || (url?.pathExtension.lowercased() == "m3u8")
+
+            lock.lock()
+            self.finalURL = url
+            self.isPlaylist = looksPlaylist
+            if self.firstByteTime == 0 { self.firstByteTime = now }
+            lock.unlock()
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            let now = CFAbsoluteTimeGetCurrent()
+            lock.lock()
+            if finished {
+                lock.unlock()
+                return
+            }
+            if firstByteTime == 0 { firstByteTime = now }
+            bytesRead += data.count
+            if isPlaylist && playlistBuffer.count < 64 * 1024 {
+                playlistBuffer.append(data)
+            }
+            let elapsed = now - firstByteTime
+            let shouldStop = !isPlaylist && (elapsed >= maxSeconds || bytesRead >= maxBytes)
+            if shouldStop {
+                let sample = Sample(
+                    finalURL: finalURL ?? dataTask.originalRequest!.url!,
+                    ttfb: max(0.001, firstByteTime - requestStart),
+                    transferDuration: max(0.01, elapsed),
+                    bytesRead: bytesRead,
+                    playlistText: nil
+                )
+                let cont = finishLocked()
+                let s = self.session
+                lock.unlock()
+                dataTask.cancel()
+                s?.invalidateAndCancel()
+                cont?.resume(returning: sample)
+                return
+            }
+            lock.unlock()
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            let now = CFAbsoluteTimeGetCurrent()
+            lock.lock()
+            guard let cont = finishLocked() else {
+                lock.unlock()
+                return
+            }
+            let s = self.session
+            let bytes = self.bytesRead
+            let tStart = self.requestStart
+            let tFirst = self.firstByteTime == 0 ? now : self.firstByteTime
+            let url = self.finalURL ?? task.originalRequest?.url ?? URL(string: "http://localhost")!
+            let plText: String? = self.isPlaylist && !self.playlistBuffer.isEmpty
+                ? String(decoding: self.playlistBuffer, as: UTF8.self)
+                : nil
+            lock.unlock()
+
+            s?.invalidateAndCancel()
+
+            if bytes > 0 {
+                let sample = Sample(
+                    finalURL: url,
+                    ttfb: max(0.001, tFirst - tStart),
+                    transferDuration: max(0.01, now - tFirst),
+                    bytesRead: bytes,
+                    playlistText: plText
+                )
+                cont.resume(returning: sample)
+            } else if let error {
+                cont.resume(throwing: error)
+            } else {
+                cont.resume(throwing: ProbeError.noData)
+            }
+        }
+    }
+}

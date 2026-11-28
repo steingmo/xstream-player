@@ -151,6 +151,10 @@ struct ContentView: View {
     @State private var guide = Guide()
     @State private var accountInfo: AccountInfo?
     @State private var loadingAccount = false
+    @State private var probeResult: StreamProbeResult?
+    @State private var probeError: String?
+    @State private var probingStream = false
+    @State private var probeTask: Task<Void, Never>?
     @State private var refreshGeneration = 0
 
     private var currentSource: Source? { sources.first(where: { $0.id == selected }) }
@@ -300,11 +304,18 @@ struct ContentView: View {
                             Store.save(sources)
                         }
                     }
-                    if currentServer != nil {
+                    if currentServer != nil || !index.channels.isEmpty {
                         AccountFooterView(
+                            showAccount: currentServer != nil,
                             info: accountInfo,
                             loading: loadingAccount,
-                            onRefresh: { Task { await loadAccountInfo() } }
+                            onRefresh: { Task { await loadAccountInfo() } },
+                            probeResult: probeResult,
+                            probeError: probeError,
+                            probingStream: probingStream,
+                            canProbe: !index.channels.isEmpty,
+                            probeBlockedByLimit: probeBlockedByConnectionLimit,
+                            onProbe: { runStreamProbe() }
                         )
                     }
                 }
@@ -376,6 +387,10 @@ struct ContentView: View {
                         Button(isFavorite(c) ? "Remove from Favorites" : "Add to Favorites") {
                             toggleFavorite(c)
                         }
+                        Button("Test Stream Speed") {
+                            runStreamProbe(for: c)
+                        }
+                        .disabled(probingStream || probeBlockedByConnectionLimit)
                     }
                 } primaryAction: { ids in
                     if let id = ids.first, let c = index.byID[id] { play(c) }
@@ -519,7 +534,13 @@ struct ContentView: View {
         .onChange(of: miniPlayer) { syncMenuBridge() }
         .onChange(of: shown.count) { syncMenuBridge() }
         .onChange(of: loading) { syncMenuBridge() }
-        .onChange(of: selected) { syncMenuBridge() }
+        .onChange(of: selected) {
+            probeTask?.cancel()
+            probingStream = false
+            probeResult = nil
+            probeError = nil
+            syncMenuBridge()
+        }
         .background(WindowAccessor { window in
             if let window { hostWindow.window = window }
         })
@@ -1195,6 +1216,40 @@ struct ContentView: View {
         await guide.load(playing, from: server)      // no debounce: the user picked this one
     }
 
+    private var probeBlockedByConnectionLimit: Bool {
+        player.isActive && (accountInfo?.maxConnections ?? 2) <= 1
+    }
+
+    private func runStreamProbe(for target: Channel? = nil) {
+        guard !probeBlockedByConnectionLimit else { return }
+        let channel = target
+            ?? playing
+            ?? index.channels.first(where: { $0.streamID != nil })
+            ?? index.channels.first
+        guard let channel else { return }
+
+        probeTask?.cancel()
+        probingStream = true
+        probeError = nil
+        probeTask = Task {
+            do {
+                let result = try await StreamProbe.measure(channel: channel)
+                if !Task.isCancelled {
+                    probeResult = result
+                    probeError = nil
+                    probingStream = false
+                }
+            } catch is CancellationError {
+                probingStream = false
+            } catch {
+                if !Task.isCancelled {
+                    probeError = error.localizedDescription
+                    probingStream = false
+                }
+            }
+        }
+    }
+
     private func loadAccountInfo() async {
         guard let server = currentServer else { accountInfo = nil; return }
         loadingAccount = true
@@ -1682,11 +1737,18 @@ struct GuideView: View {
     }
 }
 
-/// Compact Xtream subscription summary pinned at the bottom of the Sources sidebar.
+/// Compact Xtream subscription summary & stream connection probe pinned at the bottom of the Sources sidebar.
 struct AccountFooterView: View {
+    let showAccount: Bool
     let info: AccountInfo?
     let loading: Bool
     let onRefresh: () -> Void
+    let probeResult: StreamProbeResult?
+    let probeError: String?
+    let probingStream: Bool
+    let canProbe: Bool
+    let probeBlockedByLimit: Bool
+    let onProbe: () -> Void
 
     private var statusColor: Color {
         guard let info else { return .secondary }
@@ -1695,50 +1757,109 @@ struct AccountFooterView: View {
         return .green
     }
 
+    private var probeColor: Color {
+        guard let probeResult else { return probeError != nil ? .red : .secondary }
+        switch probeResult.quality {
+        case .good: return .green
+        case .fair: return .orange
+        case .poor: return .red
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Circle().fill(statusColor).frame(width: 7, height: 7)
-                if let info {
-                    Text(info.isTrial ? "\(info.status) · Trial" : info.status)
-                        .font(.caption).bold()
-                } else {
-                    Text(loading ? "Checking account…" : "Account")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if loading {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    Button(action: onRefresh) {
-                        Image(systemName: "arrow.clockwise").font(.caption2)
+            if showAccount {
+                HStack(spacing: 6) {
+                    Circle().fill(statusColor).frame(width: 7, height: 7)
+                    if let info {
+                        Text(info.isTrial ? "\(info.status) · Trial" : info.status)
+                            .font(.caption).bold()
+                    } else {
+                        Text(loading ? "Checking account…" : "Account")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .help("Refresh subscription status")
+                    Spacer()
+                    if loading {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Button(action: onRefresh) {
+                            Image(systemName: "arrow.clockwise").font(.caption2)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("Refresh subscription status")
+                    }
+                }
+                if let info {
+                    if let exp = info.expiresAt {
+                        let days = info.daysRemaining()
+                        let suffix: String = {
+                            guard let days else { return "" }
+                            if days < 0 { return " (expired)" }
+                            if days == 0 { return " (today)" }
+                            return " (\(days)d)"
+                        }()
+                        Text("Expires \(exp.formatted(date: .abbreviated, time: .omitted))\(suffix)")
+                            .font(.caption2)
+                            .foregroundStyle((days ?? 99) <= 7 ? statusColor : .secondary)
+                    } else {
+                        Text("No expiry")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let cons = info.connectionsSummary {
+                        Text("Connections: \(cons)")
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
-            if let info {
-                if let exp = info.expiresAt {
-                    let days = info.daysRemaining()
-                    let suffix: String = {
-                        guard let days else { return "" }
-                        if days < 0 { return " (expired)" }
-                        if days == 0 { return " (today)" }
-                        return " (\(days)d)"
-                    }()
-                    Text("Expires \(exp.formatted(date: .abbreviated, time: .omitted))\(suffix)")
-                        .font(.caption2)
-                        .foregroundStyle((days ?? 99) <= 7 ? statusColor : .secondary)
-                } else {
-                    Text("No expiry")
+
+            if canProbe {
+                if showAccount {
+                    Divider().padding(.vertical, 3)
+                }
+                HStack(spacing: 6) {
+                    Circle().fill(probeColor).frame(width: 7, height: 7)
+                    Text("Stream Server")
+                        .font(.caption).bold()
+                    Spacer()
+                    if probingStream {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Button("Test", action: onProbe)
+                            .buttonStyle(.link)
+                            .font(.caption2)
+                            .disabled(probeBlockedByLimit)
+                            .help(probeBlockedByLimit
+                                  ? "Stop playback first — your account allows 1 active connection"
+                                  : "Measure ping & throughput to the actual stream server")
+                    }
+                }
+                if probeBlockedByLimit {
+                    Text("Stop playback to test (1-conn limit)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                }
-                if let cons = info.connectionsSummary {
-                    Text("Connections: \(cons)")
+                } else if let r = probeResult {
+                    let jitterStr = r.jitterMs > 0 ? " (±\(r.jitterMs))" : ""
+                    Text(String(format: "%.1f Mbps · %d ms%@", r.throughputMbps, r.pingMs, jitterStr))
+                        .font(.caption2).monospacedDigit()
+                        .foregroundStyle(.primary.opacity(0.9))
+                    Text(r.resolvedHost)
                         .font(.caption2)
-                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help("Tested via \(r.channelName) · TTFB \(r.ttfbMs) ms")
+                } else if let probeError {
+                    Text(probeError)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                } else {
+                    Text(probingStream ? "Measuring stream throughput…" : "Tap Test to check stream speed")
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }

@@ -367,6 +367,18 @@ final class PlayerController {
     private(set) var bufferSeconds: Double = 0
     private(set) var videoBitrate: Double = 0
     private(set) var audioBitrate: Double = 0
+    private(set) var downloadSpeedBytesPerSec: Double = 0
+
+    enum StreamHealth {
+        case good, fair, poor
+    }
+
+    var streamHealth: StreamHealth {
+        if isBuffering || reconnectAttempt > 0 { return .poor }
+        let lowThreshold = bufferProfile == .fast ? 0.6 : 1.5
+        if bufferSeconds > 0 && bufferSeconds < lowThreshold { return .fair }
+        return .good
+    }
 
     var showStats = false
 
@@ -433,6 +445,7 @@ final class PlayerController {
     @ObservationIgnored private var lastBufferUpdate: TimeInterval = 0
     @ObservationIgnored private var lastVideoBitrateUpdate: TimeInterval = 0
     @ObservationIgnored private var lastAudioBitrateUpdate: TimeInterval = 0
+    @ObservationIgnored private var lastCacheSpeedUpdate: TimeInterval = 0
     @ObservationIgnored private var videoHeight: Int64 = 0
     @ObservationIgnored private var videoCodec: String?
     @ObservationIgnored private var lastErrorLog: String?
@@ -526,6 +539,7 @@ final class PlayerController {
         bufferSeconds = 0
         videoBitrate = 0
         audioBitrate = 0
+        downloadSpeedBytesPerSec = 0
         if channel.streamID != nil && playbackSpeed != 1.0 {
             playbackSpeed = 1.0
         }
@@ -594,6 +608,7 @@ final class PlayerController {
         bufferSeconds = 0
         videoBitrate = 0
         audioBitrate = 0
+        downloadSpeedBytesPerSec = 0
         audioTracks = []
         subtitleTracks = []
         errorMessage = nil
@@ -823,6 +838,7 @@ final class PlayerController {
         mpv_observe_property(handle, 0, "demuxer-cache-duration", MPV_FORMAT_DOUBLE)
         mpv_observe_property(handle, 0, "video-bitrate", MPV_FORMAT_DOUBLE)
         mpv_observe_property(handle, 0, "audio-bitrate", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(handle, 0, "cache-speed", MPV_FORMAT_INT64)
         mpv_observe_property(handle, 0, "track-list/count", MPV_FORMAT_INT64)
         mpv_observe_property(handle, 0, "aid", MPV_FORMAT_STRING)
         mpv_observe_property(handle, 0, "sid", MPV_FORMAT_STRING)
@@ -1098,6 +1114,20 @@ final class PlayerController {
                 if now - self.lastAudioBitrateUpdate >= 0.5 || self.audioBitrate == 0 {
                     self.lastAudioBitrateUpdate = now
                     self.audioBitrate = clean
+                }
+            }
+
+        case "cache-speed":
+            let val: Int64 = (prop.format == MPV_FORMAT_INT64 && prop.data != nil)
+                ? prop.data!.assumingMemoryBound(to: Int64.self).pointee
+                : 0
+            let clean = val > 0 ? Double(val) : 0
+            let now = Date.timeIntervalSinceReferenceDate
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if now - self.lastCacheSpeedUpdate >= 0.5 || self.downloadSpeedBytesPerSec == 0 {
+                    self.lastCacheSpeedUpdate = now
+                    self.downloadSpeedBytesPerSec = clean
                 }
             }
 
@@ -1430,6 +1460,9 @@ struct EmbeddedPlayerView: View {
                 Text("Audio: \(ac)\(chStr)\(abrStr)")
             }
             Text(String(format: "Buffer: %.1fs (%@)", controller.bufferSeconds, controller.bufferProfile.label))
+            if controller.downloadSpeedBytesPerSec > 0 {
+                Text("Download: \(formatBitrate(controller.downloadSpeedBytesPerSec * 8))")
+            }
             Text("Dropped frames: \(controller.droppedFrames)")
         }
         .font(.caption2).monospaced()
@@ -1480,6 +1513,30 @@ struct EmbeddedPlayerView: View {
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
                     .background(.black.opacity(0.45), in: Capsule())
+            }
+
+            if !isMiniPlayer && controller.isPlaying {
+                let healthColor: Color = {
+                    switch controller.streamHealth {
+                    case .good: return .green
+                    case .fair: return .orange
+                    case .poor: return .red
+                    }
+                }()
+                let speedStr = controller.downloadSpeedBytesPerSec > 0
+                    ? formatBitrate(controller.downloadSpeedBytesPerSec * 8)
+                    : String(format: "%.1fs buf", controller.bufferSeconds)
+                HStack(spacing: 4) {
+                    Circle().fill(healthColor).frame(width: 6, height: 6)
+                    Text(speedStr)
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(.black.opacity(0.45), in: Capsule())
+                .help(String(format: "Stream health · Buffer %.1fs (%@)", controller.bufferSeconds, controller.bufferProfile.label))
             }
 
             Spacer()
