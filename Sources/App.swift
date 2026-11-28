@@ -34,7 +34,9 @@ struct XstreamApp: App {
     private let updater = SPUStandardUpdaterController(startingUpdater: true,
                                                       updaterDelegate: nil,
                                                       userDriverDelegate: nil)
+    @Environment(\.openWindow) private var openWindow
     @State private var bridge = PlaybackMenuBridge()
+    @State private var shortcuts = ShortcutStore.shared
 
     init() {
         // Channel logos rarely carry cache headers, and the default cache is a few MB, so
@@ -49,49 +51,62 @@ struct XstreamApp: App {
                 CommandGroup(after: .appInfo) {
                     Button("Check for Updates…") { updater.updater.checkForUpdates() }
                 }
+                CommandGroup(replacing: .help) {
+                    Button("Xstream Help") { openWindow(id: "help") }
+                        .keyboardShortcut("?", modifiers: .command)
+                }
                 CommandMenu("Playback") {
                     Button(bridge.isPaused ? "Play" : "Pause") { bridge.onTogglePlayPause?() }
-                        .keyboardShortcut("p", modifiers: .command)
+                        .keyboardShortcut(shortcuts.combo(for: .togglePlayPause).keyboardShortcut)
                         .disabled(!bridge.hasActivePlayer)
                     Button("Stop") { bridge.onStop?() }
-                        .keyboardShortcut(".", modifiers: .command)
+                        .keyboardShortcut(shortcuts.combo(for: .stop).keyboardShortcut)
                         .disabled(!bridge.hasActivePlayer)
                     Button("Reload Stream") { bridge.onReloadStream?() }
-                        .keyboardShortcut("r", modifiers: [.command, .shift])
+                        .keyboardShortcut(shortcuts.combo(for: .reloadStream).keyboardShortcut)
                         .disabled(!bridge.hasActivePlayer)
                     Divider()
                     Button("Previous Channel") { bridge.onPreviousChannel?() }
-                        .keyboardShortcut("[", modifiers: .command)
+                        .keyboardShortcut(shortcuts.combo(for: .previousChannel).keyboardShortcut)
                         .disabled(!bridge.canZap)
                     Button("Next Channel") { bridge.onNextChannel?() }
-                        .keyboardShortcut("]", modifiers: .command)
+                        .keyboardShortcut(shortcuts.combo(for: .nextChannel).keyboardShortcut)
                         .disabled(!bridge.canZap)
                     Divider()
                     Button(bridge.isMuted ? "Unmute" : "Mute") { bridge.onToggleMute?() }
-                        .keyboardShortcut("m", modifiers: [.command, .shift])
+                        .keyboardShortcut(shortcuts.combo(for: .toggleMute).keyboardShortcut)
                         .disabled(!bridge.hasActivePlayer)
                     Button(bridge.isMiniPlayer ? "Return to Window" : "Floating Mini-Player") {
                         bridge.onToggleMiniPlayer?()
                     }
-                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcuts.combo(for: .toggleMiniPlayer).keyboardShortcut)
                     .disabled(!bridge.hasActivePlayer)
                     Button(bridge.isTheaterMode ? "Exit Fullscreen" : "Fullscreen") {
                         bridge.onToggleFullScreen?()
                     }
-                    .keyboardShortcut("f", modifiers: [.command, .shift])
+                    .keyboardShortcut(shortcuts.combo(for: .toggleFullScreen).keyboardShortcut)
                     .disabled(!bridge.hasActivePlayer)
                     Button("Channel Drawer") { bridge.onToggleDrawer?() }
-                        .keyboardShortcut("l", modifiers: .command)
+                        .keyboardShortcut(shortcuts.combo(for: .toggleDrawer).keyboardShortcut)
                         .disabled(!bridge.isTheaterMode)
                     Button("Quick Channel Switcher…") { bridge.onQuickSwitch?() }
-                        .keyboardShortcut("k", modifiers: .command)
+                        .keyboardShortcut(shortcuts.combo(for: .quickSwitcher).keyboardShortcut)
                         .disabled(!bridge.canQuickSwitch)
                     Divider()
                     Button("Refresh Source") { bridge.onRefresh?() }
-                        .keyboardShortcut("r", modifiers: .command)
+                        .keyboardShortcut(shortcuts.combo(for: .refreshSource).keyboardShortcut)
                         .disabled(!bridge.canRefresh)
                 }
             }
+
+        Settings {
+            SettingsView(updater: updater.updater, shortcuts: shortcuts)
+        }
+
+        Window("Xstream Help", id: "help") {
+            HelpView(shortcuts: shortcuts)
+        }
+        .defaultSize(width: 640, height: 560)
     }
 }
 
@@ -528,6 +543,9 @@ struct ContentView: View {
         .onDisappear {
             closeMiniPlayer()
             if player.isActive { player.stop() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .xstreamPlaybackPreferencesChanged)) { _ in
+            player.syncPreferencesFromDefaults()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             closeMiniPlayer()

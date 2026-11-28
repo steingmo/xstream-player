@@ -372,6 +372,8 @@ final class PlayerController {
 
     var deinterlace: DeinterlaceMode = .auto {
         didSet {
+            guard deinterlace != oldValue else { return }
+            UserDefaults.standard.set(deinterlace.rawValue, forKey: PlaybackPrefs.deinterlaceKey)
             setString("deinterlace", deinterlace.rawValue)
             flashOSD("Deinterlace: \(deinterlace.label)")
         }
@@ -379,6 +381,8 @@ final class PlayerController {
 
     var aspectMode: AspectMode = .auto {
         didSet {
+            guard aspectMode != oldValue else { return }
+            UserDefaults.standard.set(aspectMode.rawValue, forKey: PlaybackPrefs.aspectModeKey)
             applyAspectMode()
             flashOSD("Aspect: \(aspectMode.label)")
         }
@@ -446,6 +450,42 @@ final class PlayerController {
         } else {
             self.bufferProfile = .balanced
         }
+        if let raw = UserDefaults.standard.string(forKey: PlaybackPrefs.deinterlaceKey),
+           let saved = DeinterlaceMode(rawValue: raw) {
+            self.deinterlace = saved
+        }
+        if let raw = UserDefaults.standard.string(forKey: PlaybackPrefs.aspectModeKey),
+           let saved = AspectMode(rawValue: raw) {
+            self.aspectMode = saved
+        }
+    }
+
+    /// Re-reads user preferences changed in the Settings window and applies them live to libmpv.
+    func syncPreferencesFromDefaults() {
+        if let raw = UserDefaults.standard.string(forKey: Self.bufferProfileKey),
+           let saved = BufferProfile(rawValue: raw), saved != bufferProfile {
+            bufferProfile = saved
+        }
+        if let raw = UserDefaults.standard.string(forKey: PlaybackPrefs.deinterlaceKey),
+           let saved = DeinterlaceMode(rawValue: raw), saved != deinterlace {
+            deinterlace = saved
+        }
+        if let raw = UserDefaults.standard.string(forKey: PlaybackPrefs.aspectModeKey),
+           let saved = AspectMode(rawValue: raw), saved != aspectMode {
+            aspectMode = saved
+        }
+        applyLanguageAndSubtitlePreferences()
+    }
+
+    private func applyLanguageAndSubtitlePreferences() {
+        let autoSubs = PlaybackPrefs.autoSubtitles
+        let subLang = PlaybackPrefs.subtitleLang
+        let audioLang = PlaybackPrefs.audioLang
+        setString("subs-fallback", autoSubs ? "yes" : "no")
+        setString("subs-match-os-language", (autoSubs && subLang.isEmpty) ? "yes" : "no")
+        setString("slang", subLang)
+        setString("alang", audioLang)
+        setString("sid", autoSubs ? "auto" : "no")
     }
 
     func ensureVideoView() -> MPVOpenGLView {
@@ -739,8 +779,14 @@ final class PlayerController {
         mpv_set_option_string(handle, "network-timeout", bufferProfile.networkTimeout)
         mpv_set_option_string(handle, "tls-verify", "no")
         mpv_set_option_string(handle, "user-agent", "VLC/3.0.21 LibVLC/3.0.21")
-        mpv_set_option_string(handle, "subs-match-os-language", "yes")
-        mpv_set_option_string(handle, "subs-fallback", "yes")
+        let autoSubs = PlaybackPrefs.autoSubtitles
+        let subLang = PlaybackPrefs.subtitleLang
+        let audioLang = PlaybackPrefs.audioLang
+        mpv_set_option_string(handle, "subs-match-os-language", (autoSubs && subLang.isEmpty) ? "yes" : "no")
+        mpv_set_option_string(handle, "subs-fallback", autoSubs ? "yes" : "no")
+        if !subLang.isEmpty { mpv_set_option_string(handle, "slang", subLang) }
+        if !audioLang.isEmpty { mpv_set_option_string(handle, "alang", audioLang) }
+        mpv_set_option_string(handle, "sid", autoSubs ? "auto" : "no")
         mpv_set_option_string(handle, "input-media-keys", "no")
         mpv_set_option_string(handle, "volume", String(Int(volume)))
         mpv_set_option_string(handle, "mute", isMuted ? "yes" : "no")
@@ -782,6 +828,7 @@ final class PlayerController {
         mpv_observe_property(handle, 0, "sid", MPV_FORMAT_STRING)
 
         mpv = handle
+        if aspectMode != .auto { applyAspectMode() }
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         mpv_set_wakeup_callback(handle, { rawCtx in
