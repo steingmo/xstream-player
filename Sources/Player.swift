@@ -1236,10 +1236,12 @@ final class MiniPlayerWindowController: NSObject, NSWindowDelegate {
         )
         let panel = NSPanel(
             contentRect: NSRect(origin: origin, size: NSSize(width: initialWidth, height: initialHeight)),
-            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.titleVisibility = .hidden
