@@ -28,8 +28,15 @@ final class PlaybackMenuBridge {
     var onRefresh: (() -> Void)?
 }
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+}
+
 @main
 struct XstreamApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     // Sparkle checks the appcast on its own schedule; this also backs the menu item.
     private let updater = SPUStandardUpdaterController(startingUpdater: true,
                                                       updaterDelegate: nil,
