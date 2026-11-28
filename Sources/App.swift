@@ -366,7 +366,6 @@ struct ContentView: View {
                     if let id = ids.first, let c = index.byID[id] { play(c) }
                 }
             }
-            .searchable(text: $query, placement: .toolbar, prompt: "Search channels")
             .navigationSplitViewColumnWidth(min: 240, ideal: 320)
             .toolbar {
                 Button { refreshGeneration += 1 } label: {
@@ -410,6 +409,18 @@ struct ContentView: View {
             }
         } detail: {
             detailPane
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            guard !index.channels.isEmpty else { return }
+                            withAnimation(.easeOut(duration: 0.14)) { showQuickSwitcher.toggle() }
+                        } label: {
+                            Image(systemName: "magnifyingglass")
+                        }
+                        .disabled(index.channels.isEmpty)
+                        .help("Quick Channel Switcher (⌘K)")
+                    }
+                }
         }
         .opacity(theaterMode ? 0 : 1)
         .allowsHitTesting(!theaterMode)
@@ -428,6 +439,10 @@ struct ContentView: View {
                     onNextChannel: shown.count > 1 ? { zapChannel(offset: 1) } : nil,
                     onToggleDrawer: {
                         withAnimation(.easeInOut(duration: 0.2)) { showFullscreenDrawer.toggle() }
+                    },
+                    onQuickSwitch: {
+                        guard !index.channels.isEmpty else { return }
+                        withAnimation(.easeOut(duration: 0.14)) { showQuickSwitcher.toggle() }
                     }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1922,8 +1937,8 @@ struct QuickChannelSwitcher: View {
     private static let maxResults = 40
 
     var body: some View {
-        ZStack(alignment: .top) {
-            Color.black.opacity(0.45)
+        ZStack(alignment: .topTrailing) {
+            Color.black.opacity(0.35)
                 .ignoresSafeArea()
                 .onTapGesture { onDismiss() }
 
@@ -2067,7 +2082,7 @@ struct QuickChannelSwitcher: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 7)
             }
-            .frame(width: 520)
+            .frame(width: 440)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .environment(\.colorScheme, .dark)
             .overlay(
@@ -2075,7 +2090,8 @@ struct QuickChannelSwitcher: View {
                     .strokeBorder(.white.opacity(0.16), lineWidth: 1)
             )
             .shadow(color: .black.opacity(0.55), radius: 28, y: 12)
-            .padding(.top, 84)
+            .padding(.top, 12)
+            .padding(.trailing, 14)
         }
         .onAppear {
             searchFocused = true

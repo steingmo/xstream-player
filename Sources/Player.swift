@@ -1214,6 +1214,7 @@ struct EmbeddedPlayerView: View {
     var onPreviousChannel: (() -> Void)? = nil
     var onNextChannel: (() -> Void)? = nil
     var onToggleDrawer: (() -> Void)? = nil
+    var onQuickSwitch: (() -> Void)? = nil
 
     @State private var showControls = true
     @State private var showSettings = false
@@ -1435,6 +1436,20 @@ struct EmbeddedPlayerView: View {
             }
 
             Spacer()
+
+            if !isMiniPlayer, let onQuickSwitch {
+                Button {
+                    onQuickSwitch()
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.white)
+                        .frame(width: 28, height: 28)
+                        .background(.black.opacity(0.5), in: Circle())
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help("Quick Channel Switcher (⌘K)")
+            }
 
             if !isMiniPlayer {
                 Button {
