@@ -364,6 +364,9 @@ final class PlayerController {
     private(set) var droppedFrames: Int64 = 0
     private(set) var audioCodec: String?
     private(set) var audioChannels: Int64 = 0
+    private(set) var bufferSeconds: Double = 0
+    private(set) var videoBitrate: Double = 0
+    private(set) var audioBitrate: Double = 0
 
     var showStats = false
 
@@ -423,6 +426,9 @@ final class PlayerController {
     @ObservationIgnored private var videoView: MPVOpenGLView?
     @ObservationIgnored private var pendingURL: URL?
     @ObservationIgnored private var lastPosUpdate: TimeInterval = 0
+    @ObservationIgnored private var lastBufferUpdate: TimeInterval = 0
+    @ObservationIgnored private var lastVideoBitrateUpdate: TimeInterval = 0
+    @ObservationIgnored private var lastAudioBitrateUpdate: TimeInterval = 0
     @ObservationIgnored private var videoHeight: Int64 = 0
     @ObservationIgnored private var videoCodec: String?
     @ObservationIgnored private var lastErrorLog: String?
@@ -477,6 +483,9 @@ final class PlayerController {
         videoCodec = nil
         audioCodec = nil
         audioChannels = 0
+        bufferSeconds = 0
+        videoBitrate = 0
+        audioBitrate = 0
         if channel.streamID != nil && playbackSpeed != 1.0 {
             playbackSpeed = 1.0
         }
@@ -496,6 +505,16 @@ final class PlayerController {
     func retry() {
         guard let ch = activeChannel else { return }
         play(ch)
+    }
+
+    func reload() {
+        guard let ch = activeChannel else { return }
+        flashOSD("Reloading stream…")
+        play(ch)
+    }
+
+    func cancelReconnect() {
+        stop()
     }
 
     func togglePlayPause() {
@@ -532,6 +551,9 @@ final class PlayerController {
         videoCodec = nil
         audioCodec = nil
         audioChannels = 0
+        bufferSeconds = 0
+        videoBitrate = 0
+        audioBitrate = 0
         audioTracks = []
         subtitleTracks = []
         errorMessage = nil
@@ -752,6 +774,9 @@ final class PlayerController {
         mpv_observe_property(handle, 0, "frame-drop-count", MPV_FORMAT_INT64)
         mpv_observe_property(handle, 0, "audio-codec-name", MPV_FORMAT_STRING)
         mpv_observe_property(handle, 0, "audio-params/channel-count", MPV_FORMAT_INT64)
+        mpv_observe_property(handle, 0, "demuxer-cache-duration", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(handle, 0, "video-bitrate", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(handle, 0, "audio-bitrate", MPV_FORMAT_DOUBLE)
         mpv_observe_property(handle, 0, "track-list/count", MPV_FORMAT_INT64)
         mpv_observe_property(handle, 0, "aid", MPV_FORMAT_STRING)
         mpv_observe_property(handle, 0, "sid", MPV_FORMAT_STRING)
@@ -987,6 +1012,48 @@ final class PlayerController {
             let ch = ptr.assumingMemoryBound(to: Int64.self).pointee
             Task { @MainActor [weak self] in self?.audioChannels = ch }
 
+        case "demuxer-cache-duration":
+            let val: Double = (prop.format == MPV_FORMAT_DOUBLE && prop.data != nil)
+                ? prop.data!.assumingMemoryBound(to: Double.self).pointee
+                : 0
+            let clean = val.isFinite && val >= 0 ? val : 0
+            let now = Date.timeIntervalSinceReferenceDate
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if now - self.lastBufferUpdate >= 0.5 || clean == 0 {
+                    self.lastBufferUpdate = now
+                    self.bufferSeconds = clean
+                }
+            }
+
+        case "video-bitrate":
+            let val: Double = (prop.format == MPV_FORMAT_DOUBLE && prop.data != nil)
+                ? prop.data!.assumingMemoryBound(to: Double.self).pointee
+                : 0
+            let clean = val.isFinite && val > 0 ? val : 0
+            let now = Date.timeIntervalSinceReferenceDate
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if now - self.lastVideoBitrateUpdate >= 0.5 || self.videoBitrate == 0 {
+                    self.lastVideoBitrateUpdate = now
+                    self.videoBitrate = clean
+                }
+            }
+
+        case "audio-bitrate":
+            let val: Double = (prop.format == MPV_FORMAT_DOUBLE && prop.data != nil)
+                ? prop.data!.assumingMemoryBound(to: Double.self).pointee
+                : 0
+            let clean = val.isFinite && val > 0 ? val : 0
+            let now = Date.timeIntervalSinceReferenceDate
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if now - self.lastAudioBitrateUpdate >= 0.5 || self.audioBitrate == 0 {
+                    self.lastAudioBitrateUpdate = now
+                    self.audioBitrate = clean
+                }
+            }
+
         case "video-codec":
             guard prop.format == MPV_FORMAT_STRING, let ptr = prop.data,
                   let cstr = ptr.assumingMemoryBound(to: UnsafePointer<CChar>?.self).pointee else { return }
@@ -1193,16 +1260,26 @@ struct EmbeddedPlayerView: View {
                 }
                 .padding(20)
                 .background(.ultraThinMaterial.opacity(0.85), in: RoundedRectangle(cornerRadius: 12))
-            } else if controller.isLoading || controller.isBuffering {
+            } else if controller.isLoading || controller.isBuffering || controller.reconnectAttempt > 0 {
                 HStack(spacing: 10) {
                     ProgressView().controlSize(.small)
                     Text(statusText)
                         .font(.callout)
                         .foregroundStyle(.white)
+                    if controller.reconnectAttempt > 0 {
+                        Button("Now") { controller.retry() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                        Button("Cancel") { controller.cancelReconnect() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
-                .background(.black.opacity(0.65), in: Capsule())
+                .background(.ultraThinMaterial, in: Capsule())
+                .environment(\.colorScheme, .dark)
+                .overlay(Capsule().strokeBorder(.white.opacity(0.15), lineWidth: 1))
             }
 
             // Stream stats overlay (optional, toggled from Video Settings)
@@ -1259,11 +1336,22 @@ struct EmbeddedPlayerView: View {
             if playing { scheduleHide() } else { showControls = true; hideTask?.cancel() }
         }
         .onChange(of: controlsVisible) { _, visible in
-            if theaterMode && !visible {
-                NSCursor.setHiddenUntilMouseMoves(true)
+            if theaterMode {
+                NSCursor.setHiddenUntilMouseMoves(!visible)
             }
         }
-        .onDisappear { hideTask?.cancel() }
+        .onChange(of: theaterMode) { _, entering in
+            if entering {
+                if controller.isPlaying { scheduleHide() }
+                if !controlsVisible { NSCursor.setHiddenUntilMouseMoves(true) }
+            } else {
+                NSCursor.setHiddenUntilMouseMoves(false)
+            }
+        }
+        .onDisappear {
+            hideTask?.cancel()
+            NSCursor.setHiddenUntilMouseMoves(false)
+        }
         .onKeyPress(.escape) {
             guard theaterMode else { return .ignored }
             onToggleFullScreen()
@@ -1285,12 +1373,15 @@ struct EmbeddedPlayerView: View {
                 Text("Video: \(controller.videoWidth)×\(controller.videoHeightValue)\(fpsStr)")
             }
             if let info = controller.videoInfo {
-                Text("Codec: \(info)")
+                let brStr = controller.videoBitrate > 0 ? " · \(formatBitrate(controller.videoBitrate))" : ""
+                Text("Codec: \(info)\(brStr)")
             }
             if let ac = controller.audioCodec {
                 let chStr = controller.audioChannels > 0 ? " (\(controller.audioChannels)ch)" : ""
-                Text("Audio: \(ac)\(chStr)")
+                let abrStr = controller.audioBitrate > 0 ? " · \(formatBitrate(controller.audioBitrate))" : ""
+                Text("Audio: \(ac)\(chStr)\(abrStr)")
             }
+            Text(String(format: "Buffer: %.1fs (%@)", controller.bufferSeconds, controller.bufferProfile.label))
             Text("Dropped frames: \(controller.droppedFrames)")
         }
         .font(.caption2).monospaced()
@@ -1302,6 +1393,13 @@ struct EmbeddedPlayerView: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(.white.opacity(0.12), lineWidth: 1)
         )
+    }
+
+    private func formatBitrate(_ bitsPerSecond: Double) -> String {
+        if bitsPerSecond >= 1_000_000 {
+            return String(format: "%.1f Mbps", bitsPerSecond / 1_000_000)
+        }
+        return String(format: "%.0f kbps", bitsPerSecond / 1_000)
     }
 
     private var topBar: some View {

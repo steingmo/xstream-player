@@ -16,6 +16,7 @@ final class PlaybackMenuBridge {
 
     var onTogglePlayPause: (() -> Void)?
     var onStop: (() -> Void)?
+    var onReloadStream: (() -> Void)?
     var onToggleMute: (() -> Void)?
     var onPreviousChannel: (() -> Void)?
     var onNextChannel: (() -> Void)?
@@ -52,6 +53,9 @@ struct XstreamApp: App {
                         .disabled(!bridge.hasActivePlayer)
                     Button("Stop") { bridge.onStop?() }
                         .keyboardShortcut(".", modifiers: .command)
+                        .disabled(!bridge.hasActivePlayer)
+                    Button("Reload Stream") { bridge.onReloadStream?() }
+                        .keyboardShortcut("r", modifiers: [.command, .shift])
                         .disabled(!bridge.hasActivePlayer)
                     Divider()
                     Button("Previous Channel") { bridge.onPreviousChannel?() }
@@ -106,6 +110,7 @@ struct ContentView: View {
     @State private var error: String?
     @State private var query = ""
     @State private var group = ChannelIndex.allGroup
+    @State private var hdOnly = false
     @State private var playing: Channel?
     @State private var player = PlayerController()
     @State private var theaterMode = false
@@ -153,10 +158,11 @@ struct ContentView: View {
         let generation: Int
         let group: String
         let query: String
+        let hdOnly: Bool
     }
 
     private var searchKey: SearchKey {
-        SearchKey(generation: searchGeneration, group: group, query: query)
+        SearchKey(generation: searchGeneration, group: group, query: query, hdOnly: hdOnly)
     }
 
     /// The Xtream server behind the selected source, if it is one — EPG needs it.
@@ -298,6 +304,7 @@ struct ContentView: View {
                         quickFilterPill("Favorites", icon: "star.fill", count: favoriteChannels.count, target: ChannelIndex.favoritesGroup)
                         quickFilterPill("Recent", icon: "clock", count: recentChannels.count, target: ChannelIndex.recentsGroup)
                         Spacer(minLength: 0)
+                        hdFilterPill
                     }
                     HStack(spacing: 6) {
                         Picker("", selection: Binding(
@@ -487,7 +494,12 @@ struct ContentView: View {
         .onChange(of: currentFilter) { applyFilter() }
         .onChange(of: group) {
             if query.trimmingCharacters(in: .whitespaces).isEmpty {
-                shown = index.base(group: group, favorites: favoriteChannels, recents: recentChannels)
+                shown = currentBasePool()
+            }
+        }
+        .onChange(of: hdOnly) {
+            if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                shown = currentBasePool()
             }
         }
         .task(id: searchKey) { await updateShown() }
@@ -528,13 +540,18 @@ struct ContentView: View {
             error = !allChannels.isEmpty && index.channels.isEmpty ? Self.allHidden : nil
         }
         if query.trimmingCharacters(in: .whitespaces).isEmpty {
-            shown = index.base(group: group, favorites: favoriteChannels, recents: recentChannels)
+            shown = currentBasePool()
         }
         searchGeneration += 1
     }
 
+    private func currentBasePool() -> [Channel] {
+        let base = index.base(group: group, favorites: favoriteChannels, recents: recentChannels)
+        return hdOnly ? base.filter { $0.quality?.isHighDefinition == true } : base
+    }
+
     private func updateShown() async {
-        let pool = index.base(group: group, favorites: favoriteChannels, recents: recentChannels)
+        let pool = currentBasePool()
         let trimmed = query.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty, !pool.isEmpty else {
             shown = pool
@@ -566,6 +583,24 @@ struct ContentView: View {
     }
 
     private static let allHidden = "Every category is hidden. Use the filter button to show some."
+
+    private var hdFilterPill: some View {
+        Button {
+            hdOnly.toggle()
+        } label: {
+            Text("HD+")
+                .font(.caption2).fontWeight(.semibold)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(
+                    hdOnly ? Color.accentColor : Color.primary.opacity(0.08),
+                    in: Capsule()
+                )
+                .foregroundStyle(hdOnly ? .white : .secondary)
+        }
+        .buttonStyle(.plain)
+        .help(hdOnly ? "Showing HD, FHD, RAW & 4K channels only" : "Filter to HD, FHD, RAW & 4K channels")
+    }
 
     @ViewBuilder
     private func quickFilterPill(_ label: String, icon: String? = nil, count: Int? = nil, target: String) -> some View {
@@ -750,6 +785,7 @@ struct ContentView: View {
                 quickFilterPill("Favorites", icon: "star.fill", count: favoriteChannels.count, target: ChannelIndex.favoritesGroup)
                 quickFilterPill("Recent", icon: "clock", count: recentChannels.count, target: ChannelIndex.recentsGroup)
                 Spacer(minLength: 0)
+                hdFilterPill
             }
             .padding(.horizontal, 12)
             .padding(.bottom, 6)
@@ -798,11 +834,16 @@ struct ContentView: View {
                                     .padding(3)
                                     .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text(c.name)
-                                        .font(.callout)
-                                        .fontWeight(isCurrent ? .semibold : .regular)
-                                        .foregroundStyle(.white)
-                                        .lineLimit(1)
+                                    HStack(spacing: 5) {
+                                        Text(c.name)
+                                            .font(.callout)
+                                            .fontWeight(isCurrent ? .semibold : .regular)
+                                            .foregroundStyle(.white)
+                                            .lineLimit(1)
+                                        if let q = c.quality {
+                                            QualityBadge(quality: q)
+                                        }
+                                    }
                                     if let now = guide.now(c) {
                                         Text(now.title)
                                             .font(.caption2)
@@ -1033,6 +1074,7 @@ struct ContentView: View {
             closeMiniPlayer()
             player.stop()
         }
+        bridge.onReloadStream = { player.reload() }
         bridge.onToggleMute = { player.toggleMute() }
         bridge.onPreviousChannel = { zapChannel(offset: -1) }
         bridge.onNextChannel = { zapChannel(offset: 1) }
@@ -1367,6 +1409,30 @@ struct SourceEditor: View {
 }
 
 /// Its own view so guide updates re-render one row, not ContentView: reading `guide` in
+struct QualityBadge: View {
+    let quality: ChannelQuality
+
+    private var tint: Color {
+        switch quality {
+        case .uhd4K: return .purple
+        case .raw: return .orange
+        case .fhd: return .blue
+        case .hd: return .green
+        case .sd: return .secondary
+        }
+    }
+
+    var body: some View {
+        Text(quality.rawValue)
+            .font(.system(size: 9, weight: .bold))
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(tint.opacity(0.18), in: RoundedRectangle(cornerRadius: 3, style: .continuous))
+            .foregroundStyle(tint)
+            .fixedSize()
+    }
+}
+
 /// ContentView's body re-ran the whole channel filter for every EPG reply.
 struct ChannelRow: View {
     let channel: Channel
@@ -1386,7 +1452,12 @@ struct ChannelRow: View {
                 .padding(3)
                 .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             VStack(alignment: .leading, spacing: 2) {
-                Text(channel.name).lineLimit(1)
+                HStack(spacing: 5) {
+                    Text(channel.name).lineLimit(1)
+                    if let q = channel.quality {
+                        QualityBadge(quality: q)
+                    }
+                }
                 if let now {
                     Text(now.title)
                         .font(.caption2)

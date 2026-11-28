@@ -2,6 +2,28 @@ import Foundation
 
 // MARK: - Model
 
+enum ChannelQuality: String, Hashable, Sendable, Comparable {
+    case uhd4K = "4K"
+    case raw = "RAW"
+    case fhd = "FHD"
+    case hd = "HD"
+    case sd = "SD"
+
+    var rank: Int {
+        switch self {
+        case .uhd4K: return 4
+        case .raw: return 3
+        case .fhd: return 2
+        case .hd: return 1
+        case .sd: return 0
+        }
+    }
+
+    static func < (lhs: ChannelQuality, rhs: ChannelQuality) -> Bool { lhs.rank < rhs.rank }
+
+    var isHighDefinition: Bool { rank >= 1 }
+}
+
 struct Channel: Identifiable, Hashable, Sendable, Codable {
     let id: String
     let name: String
@@ -10,6 +32,60 @@ struct Channel: Identifiable, Hashable, Sendable, Codable {
     let url: URL
     /// Xtream live stream id — nil for VOD and for M3U entries, which have no EPG.
     var streamID: String? = nil
+
+    var quality: ChannelQuality? { Self.parseQuality(name) }
+
+    /// Detects quality tags like 4K/UHD/2160p, RAW, FHD/1080p, HD/720p, SD (including
+    /// Unicode superscript tags such as ᴴᴰ or ᴿᴬᵂ common on IPTV portals) on whole-word
+    /// boundaries so words like "Shadow" or "Draw" never false-match.
+    static func parseQuality(_ name: String) -> ChannelQuality? {
+        var normalized = String()
+        normalized.reserveCapacity(name.count)
+        for ch in name {
+            switch ch {
+            case "ᴬ": normalized.append("A")
+            case "ᴰ": normalized.append("D")
+            case "ᶠ": normalized.append("F")
+            case "ᴴ": normalized.append("H")
+            case "ᴷ": normalized.append("K")
+            case "ᴾ": normalized.append("P")
+            case "ᴿ": normalized.append("R")
+            case "ˢ": normalized.append("S")
+            case "ᵁ": normalized.append("U")
+            case "ᵂ": normalized.append("W")
+            case "⁰": normalized.append("0")
+            case "¹": normalized.append("1")
+            case "²": normalized.append("2")
+            case "⁴": normalized.append("4")
+            case "⁶": normalized.append("6")
+            case "⁷": normalized.append("7")
+            case "⁸": normalized.append("8")
+            default:
+                if ch.isLetter || ch.isNumber {
+                    normalized.append(ch.uppercased())
+                } else {
+                    normalized.append(" ")
+                }
+            }
+        }
+
+        var best: ChannelQuality?
+        for token in normalized.split(separator: " ") {
+            let candidate: ChannelQuality?
+            switch token {
+            case "4K", "UHD", "2160P": candidate = .uhd4K
+            case "RAW": candidate = .raw
+            case "FHD", "1080P": candidate = .fhd
+            case "HD", "720P": candidate = .hd
+            case "SD", "576P", "480P": candidate = .sd
+            default: candidate = nil
+            }
+            if let candidate, best == nil || candidate > best! {
+                best = candidate
+            }
+        }
+        return best
+    }
 }
 
 struct Programme: Identifiable, Hashable, Sendable {
